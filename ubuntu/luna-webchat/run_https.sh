@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/ai/luna-webchat
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 if [[ ! -d .venv ]]; then
   python3 -m venv .venv
@@ -9,7 +10,7 @@ fi
 source .venv/bin/activate
 pip install -r requirements.txt
 
-CERT_DIR="/home/ai/luna-webchat/.certs"
+CERT_DIR="$SCRIPT_DIR/.certs"
 CERT_FILE="$CERT_DIR/luna-cert.pem"
 KEY_FILE="$CERT_DIR/luna-key.pem"
 PRIMARY_IP="$(hostname -I | awk '{print $1}')"
