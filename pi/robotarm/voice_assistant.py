@@ -67,6 +67,10 @@ _WHISPER_MODEL = str(getattr(config, "VOICE_WHISPER_MODEL", "whisper-1"))
 _GPT_MODEL = str(getattr(config, "VOICE_GPT_MODEL", "gpt-4-turbo"))
 _GPT_TEMPERATURE = float(getattr(config, "VOICE_GPT_TEMPERATURE", 0.7))
 _MAX_CONTEXT_TURNS = int(getattr(config, "VOICE_MAX_CONTEXT_TURNS", 10))
+_LUNA_CHAT_URL = str(getattr(config, "VOICE_LUNA_CHAT_URL", "")).strip()
+_LUNA_CHAT_PROFILE = str(getattr(config, "VOICE_LUNA_CHAT_PROFILE", "general"))
+_LUNA_CHAT_VERIFY_SSL = bool(getattr(config, "VOICE_LUNA_CHAT_VERIFY_SSL", True))
+_LUNA_CHAT_TIMEOUT_S = float(getattr(config, "VOICE_LUNA_CHAT_TIMEOUT_S", 25.0))
 _SYSTEM_PROMPT = str(getattr(
     config,
     "VOICE_SYSTEM_PROMPT",
@@ -636,6 +640,38 @@ def get_ai_tools_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Luna webchat routing (shares Windows PC control, camera, and memory with
+# typed chat). Falls back to the direct model below if unreachable.
+# ---------------------------------------------------------------------------
+def _call_luna_chat(user_text: str) -> str | None:
+    if not _LUNA_CHAT_URL:
+        return None
+    try:
+        import requests
+        with _history_lock:
+            trimmed = list(_history[-(_MAX_CONTEXT_TURNS * 2):])
+        messages = [{"role": m["role"], "content": m["content"]} for m in trimmed]
+        messages.append({"role": "user", "content": user_text})
+        response = requests.post(
+            _LUNA_CHAT_URL,
+            json={"messages": messages, "profile": _LUNA_CHAT_PROFILE},
+            timeout=_LUNA_CHAT_TIMEOUT_S,
+            verify=_LUNA_CHAT_VERIFY_SSL,
+        )
+        if response.status_code != 200:
+            print(f"[Voice] Luna chat error {response.status_code}: {response.text[:200]}")
+            return None
+        reply = str(response.json().get("reply", "")).strip()
+        if not reply:
+            return None
+        _add_to_history(user_text, reply)
+        return reply
+    except Exception as exc:
+        print(f"[Voice] Luna chat unreachable, falling back to direct model: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # GPT-4 Turbo chat
 # ---------------------------------------------------------------------------
 def _chat(user_text: str) -> str:
@@ -742,7 +778,9 @@ def _voice_loop():
         if transcript:
             print(f"[Voice] Heard (rms={rms:.0f}): {transcript}")
             print(f"[Voice] → GPT: {transcript}")
-            reply = _chat(transcript)
+            reply = _call_luna_chat(transcript)
+            if reply is None:
+                reply = _chat(transcript)
             if reply:
                 print(f"[Voice] ← GPT: {reply}")
                 try:

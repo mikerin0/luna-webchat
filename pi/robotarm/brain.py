@@ -244,6 +244,35 @@ def set_servo_power(on: bool) -> bool:
         return False
 
 
+def get_servo_power_status(timeout_s: float = 4.0) -> bool | None:
+    """Query the Shelly relay for the arm control box power state.
+    Returns True (on) / False (off), or None if the relay could not be reached."""
+    url = f"http://{SHELLY_RELAY_IP}/relay/0"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return bool(data.get("ison"))
+    except Exception as exc:
+        print(f"[Brain] Shelly relay status error: {exc}")
+        return None
+
+
+def toggle_servo_power() -> bool | None:
+    """Flip the arm control box relay based on its current state.
+    Returns the new state (True=on/False=off), or None on failure."""
+    current = get_servo_power_status()
+    target = not current if current is not None else True
+    return target if set_servo_power(target) else None
+
+
+def power_on_and_rest() -> bool:
+    """Turn on the arm relay and move to the 'rest' pose once the controller has booted."""
+    if not set_servo_power(True):
+        return False
+    time.sleep(max(0.0, float(getattr(config, "ARM_POWER_ON_BOOT_WAIT_S", 1.2))))
+    return run_pose("rest")
+
+
 def _clamp_servo_position(servo_id: int, position: int) -> int:
     if int(servo_id) == _SERVO_CLAW_ID:
         return max(_SERVO_CLAW_MIN, min(_SERVO_CLAW_MAX, int(position)))
