@@ -54,6 +54,10 @@ LUNA_PI_HOST = os.getenv("LUNA_PI_HOST", "172.31.31.103").strip()
 LUNA_PI_USER = os.getenv("LUNA_PI_USER", "arm").strip()
 LUNA_PI_PASSWORD = os.getenv("LUNA_PI_PASSWORD", "i82much").strip()
 LUNA_PI_VENV = os.getenv("LUNA_PI_VENV", "/home/arm/hailo-rpi5-examples/venv_hailo_rpi_examples/bin/activate").strip()
+LUNA_PI_HEADLESS_URL = os.getenv("LUNA_PI_HEADLESS_URL", "http://172.31.31.103:8004").strip()
+LUNA_PI_HEADLESS_TOKEN = os.getenv("LUNA_PI_HEADLESS_TOKEN", "").strip()
+LUNA_PI_HEADLESS_TIMEOUT = float(os.getenv("LUNA_PI_HEADLESS_TIMEOUT", "8"))
+LUNA_PI_HEADLESS_CONTROL_TIMEOUT = float(os.getenv("LUNA_PI_HEADLESS_CONTROL_TIMEOUT", "20"))
 LUNA_PI_OBJECT_DETECT_SCRIPT = os.getenv("LUNA_PI_OBJECT_DETECT_SCRIPT", "/home/arm/robotarm/hailo_object_detect.py").strip()
 LUNA_PI_DETECT_FRAMES = max(1, int(os.getenv("LUNA_PI_DETECT_FRAMES", "8")))
 LUNA_PI_DETECT_MIN_CONFIDENCE = float(os.getenv("LUNA_PI_DETECT_MIN_CONFIDENCE", "0.20"))
@@ -216,13 +220,7 @@ async def _analyze_pi_camera_with_pi_hailo(camera_index: int) -> tuple[str | Non
     for item in detections
   ]
   response = "The Pi Hailo object detector reports these repeated model detections: " + ", ".join(parts)
-  if camera_index == 0 and LUNA_PI_DETECT_CLOSEUP_TABLE:
-    response += (
-      ". Taken together, these labels are consistent with a small vehicle in the close-up, "
-      "but this COCO model has no dedicated ATV class, so I cannot verify that exact identity."
-    )
-  else:
-    response += ". These are model labels, not a guarantee of the objects' exact identities."
+  response += ". These are model labels, not a guarantee of the objects' exact identities."
   return response, None
 
 
@@ -1301,6 +1299,37 @@ async def system_stats() -> dict[str, Any]:
   return await _server_stats()
 
 
+async def _pi_headless_request(method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+  if not LUNA_PI_HEADLESS_URL:
+    return {"ok": False, "error": "Pi headless URL is not configured."}
+  headers = {"Authorization": f"Bearer {LUNA_PI_HEADLESS_TOKEN}"} if LUNA_PI_HEADLESS_TOKEN else {}
+  # Actions like arm_power_on/toggle run a multi-step pose on the Pi, so control
+  # requests need more headroom than a plain status poll.
+  timeout = LUNA_PI_HEADLESS_CONTROL_TIMEOUT if method == "POST" else LUNA_PI_HEADLESS_TIMEOUT
+  try:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+      response = await client.request(method, f"{LUNA_PI_HEADLESS_URL.rstrip('/')}/status" if method == "GET" else f"{LUNA_PI_HEADLESS_URL.rstrip('/')}/control", json=payload, headers=headers)
+    if response.status_code != 200:
+      return {"ok": False, "error": f"Pi headless service returned HTTP {response.status_code}."}
+    return response.json()
+  except (httpx.HTTPError, ValueError) as exc:
+    return {"ok": False, "error": f"Pi headless service unreachable: {exc}"}
+
+
+@app.get("/api/pi/headless/status")
+async def pi_headless_status() -> dict[str, Any]:
+  return await _pi_headless_request()
+
+
+@app.post("/api/pi/headless/control")
+async def pi_headless_control(request: Request) -> dict[str, Any]:
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  return await _pi_headless_request("POST", payload if isinstance(payload, dict) else {})
+
+
 @app.get("/api/robot/camera")
 async def robot_camera(request: Request) -> Any:
     cam_param = (request.query_params.get("cam") or "0").strip()
@@ -1381,6 +1410,11 @@ def home() -> HTMLResponse:
           <select class=\"small\" id=\"modelSelect\"></select>
         </div>
         <div class=\"row\">
+          <span class=\"small\" id=\"piStatus\">Pi headless: checking...</span>
+          <button class=\"ghost small\" id=\"piMute\" type=\"button\">Mute Pi Mic</button>
+          <button class=\"ghost small\" id=\"piPower\" type=\"button\">Arm Power</button>
+        </div>
+        <div class=\"row\">
           <input class=\"small\" id=\"files\" type=\"file\" multiple />
           <label class=\"small\" style=\"display:flex;align-items:center;gap:6px;border:1px solid #d8cdbd;border-radius:10px;padding:8px 10px;background:#fff8ec;white-space:nowrap;\">
             <input id=\"webResearch\" type=\"checkbox\" />
@@ -1408,6 +1442,9 @@ const bookFileInput = document.getElementById('bookFile');
 const ingestBookBtn = document.getElementById('ingestBook');
 const profileSelect = document.getElementById('profileSelect');
 const modelSelect = document.getElementById('modelSelect');
+const piStatus = document.getElementById('piStatus');
+const piMuteBtn = document.getElementById('piMute');
+const piPowerBtn = document.getElementById('piPower');
 const newProfileBtn = document.getElementById('newProfile');
 const webResearch = document.getElementById('webResearch');
 const attachmentsBox = document.getElementById('attachments');
@@ -1418,6 +1455,49 @@ let chatHistory = [];
 let inputHistory = [];
 let inputHistoryIndex = -1;
 let inputHistoryDraft = '';
+
+async function refreshPiHeadlessStatus() {
+  try {
+    const r = await fetch('/api/pi/headless/status');
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || 'offline');
+    piStatus.textContent = `Pi headless: ${data.mic_muted ? 'muted' : 'listening'}${data.speaking ? ' / speaking' : ''}`;
+    piMuteBtn.textContent = data.mic_muted ? 'Unmute Pi Mic' : 'Mute Pi Mic';
+    piPowerBtn.textContent = data.arm_power === true ? 'Arm Power: ON' : data.arm_power === false ? 'Arm Power: OFF' : 'Arm Power: unknown';
+  } catch (_) {
+    piStatus.textContent = 'Pi headless: offline';
+  }
+}
+
+async function controlPi(payload) {
+  const r = await fetch('/api/pi/headless/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) throw new Error(data.error || 'Pi control failed');
+  return data;
+}
+
+piMuteBtn.addEventListener('click', async () => {
+  try {
+    const data = await fetch('/api/pi/headless/status').then(r => r.json());
+    await controlPi({ action: data.mic_muted ? 'unmute' : 'mute' });
+    await refreshPiHeadlessStatus();
+  } catch (err) {
+    addSystem('Pi control error: ' + err.message, true);
+  }
+});
+
+piPowerBtn.addEventListener('click', async () => {
+  try {
+    await controlPi({ action: 'arm_power_toggle' });
+    await refreshPiHeadlessStatus();
+  } catch (err) {
+    addSystem('Arm power control error: ' + err.message, true);
+  }
+});
 
 q.addEventListener('keydown', (e) => {
   if ((e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || inputHistory.length === 0) return;
@@ -1796,6 +1876,8 @@ form.addEventListener('submit', async (e) => {
 loadProfiles();
 loadModels();
 setupSpeechRecognition();
+refreshPiHeadlessStatus();
+setInterval(refreshPiHeadlessStatus, 5000);
 
 </script>
 </body>

@@ -8,6 +8,8 @@ ARDUCAM_V4L2_DEVICE = "/dev/video0"    # table cam
 # Wide FOV capture resolution (IMX708 native 16:9)
 CAM_SENSOR_W = 1536
 CAM_SENSOR_H = 864
+# Seconds to wait after the arm relay powers on before moving to the rest pose.
+ARM_POWER_ON_BOOT_WAIT_S = 1.2
 """ 
 Camera Index Mapping (from rpicam-hello --list-cameras):
 	0 : table cam  (/base/axi/pcie@1000120000/rp1/i2c@88000/imx708@1a)
@@ -179,26 +181,34 @@ VOICE_RECORD_CHUNK_S = 4.0
 VOICE_OPENAI_BASE_URL = "http://172.31.31.106:3000/api/v1"
 VOICE_WHISPER_MODEL = "whisper-1"
 VOICE_GPT_MODEL = "llama-me:latest"
+# Route voice utterances through Luna's own /api/chat first so Windows PC
+# control, camera queries, and memory work the same as typed chat. Falls back
+# to the direct model above if Luna's webchat is unreachable. Leave the URL
+# empty to always use the direct model instead.
+VOICE_LUNA_CHAT_URL = "https://172.31.31.106:3010/api/chat"
+VOICE_LUNA_CHAT_PROFILE = "general"
+VOICE_LUNA_CHAT_VERIFY_SSL = False
+VOICE_LUNA_CHAT_TIMEOUT_S = 25.0
 # Higher temperature makes responses less robotic and less templated.
-VOICE_GPT_TEMPERATURE = 0.9
+VOICE_GPT_TEMPERATURE = 0.2
 # Number of conversation turns retained as context.
 VOICE_MAX_CONTEXT_TURNS = 10
 # VAD endpointing knobs (webrtcvad):
 # mode: 0=least aggressive, 3=most aggressive speech detection.
-VOICE_VAD_MODE = 2
+VOICE_VAD_MODE = 3
 # Frame size in ms. webrtcvad supports 10/20/30.
 VOICE_VAD_FRAME_MS = 30
 # Consecutive speech frames required before recording starts.
-VOICE_VAD_START_FRAMES = 4
+VOICE_VAD_START_FRAMES = 8
 # End utterance after this much consecutive silence.
 VOICE_VAD_END_SILENCE_MS = 900
 # Minimum and maximum utterance duration bounds.
-VOICE_MIN_UTTERANCE_MS = 450
+VOICE_MIN_UTTERANCE_MS = 900
 VOICE_MAX_UTTERANCE_S = 12.0
 # RMS energy threshold (0–32767).  Chunks below this level are treated as
 # silence and never sent to Whisper.  Raise if background noise causes false
 # triggers; lower if you have a very quiet voice.
-VOICE_ENERGY_THRESHOLD = 400.0
+VOICE_ENERGY_THRESHOLD = 550.0
 # Seconds of additional mic suppression after TTS finishes playing.
 # Prevents the room echo / BT reverb tail from being heard as a new utterance.
 VOICE_POST_SPEECH_MUTE_S = 1.5
