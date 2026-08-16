@@ -117,14 +117,34 @@ def _normalize_profile(profile: str) -> str:
     return cleaned or "general"
 
 
-async def _capture_pi_camera_image(camera_index: int) -> tuple[str | None, str | None]:
+async def _capture_pi_camera_image(camera_index: int, annotated: bool = False) -> tuple[str | None, str | None]:
     if not LUNA_PI_HOST or not LUNA_PI_USER:
         return None, "Pi camera host is not configured."
+    if annotated:
+      detector_command = (
+        f"source {shlex.quote(LUNA_PI_VENV)} && "
+        f"python3 {shlex.quote(LUNA_PI_OBJECT_DETECT_SCRIPT)} "
+        f"--camera {int(camera_index)} --frames {LUNA_PI_DETECT_FRAMES} "
+        f"--confidence {LUNA_PI_DETECT_MIN_CONFIDENCE} "
+        f"--annotated-output /tmp/luna_hailo_annotated_{camera_index}.jpg"
+        + (" --closeup" if camera_index == 0 and LUNA_PI_DETECT_CLOSEUP_TABLE else "")
+      )
+      output_path = f"/tmp/luna_hailo_annotated_{camera_index}.jpg"
+      remote_command = (
+        f"{detector_command} >/tmp/luna_hailo_detect_{camera_index}.json "
+        f"2>/tmp/luna_hailo_detect_{camera_index}.log && "
+        f"base64 -w0 {shlex.quote(output_path)}"
+      )
+    else:
+      remote_command = (
+        f"source {shlex.quote(LUNA_PI_VENV)} && "
+        f"rpicam-jpeg --camera {camera_index} --width 640 --height 360 "
+        f"--output /tmp/luna_cam_{camera_index}.jpg --timeout 500 >/tmp/luna_cam_{camera_index}.log 2>&1 && "
+        f"base64 -w0 /tmp/luna_cam_{camera_index}.jpg"
+      )
     cmd = (
-        f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no {shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} "
-        f"'source {shlex.quote(LUNA_PI_VENV)} && rm -f /tmp/luna_cam_{camera_index}.jpg /tmp/luna_cam_{camera_index}.txt && "
-        f"rpicam-jpeg --camera {camera_index} --width 640 --height 360 --output /tmp/luna_cam_{camera_index}.jpg --timeout 500 >/tmp/luna_cam_{camera_index}.log 2>&1 && "
-        f"python3 - <<\"PY\"\nfrom pathlib import Path\nimport base64\npath = Path(\"/tmp/luna_cam_{camera_index}.jpg\")\nprint(base64.b64encode(path.read_bytes()).decode())\nPY'"
+      f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no "
+      f"{shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} {shlex.quote(remote_command)}"
     )
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -195,12 +215,15 @@ async def _analyze_pi_camera_with_pi_hailo(camera_index: int) -> tuple[str | Non
     f"{str(item.get('label', 'unknown'))} ({float(item.get('confidence', 0.0)):.0%} confidence)"
     for item in detections
   ]
-  return (
-    "The Pi Hailo object detector reports these repeated model detections: "
-    + ", ".join(parts)
-    + ". Taken together, these labels are consistent with a small vehicle in the close-up, "
-    + "but this COCO model has no dedicated ATV class, so I cannot verify that exact identity."
-  ), None
+  response = "The Pi Hailo object detector reports these repeated model detections: " + ", ".join(parts)
+  if camera_index == 0 and LUNA_PI_DETECT_CLOSEUP_TABLE:
+    response += (
+      ". Taken together, these labels are consistent with a small vehicle in the close-up, "
+      "but this COCO model has no dedicated ATV class, so I cannot verify that exact identity."
+    )
+  else:
+    response += ". These are model labels, not a guarantee of the objects' exact identities."
+  return response, None
 
 
 async def _analyze_pi_camera_with_hailo(camera_index: int) -> tuple[str | None, str | None]:
@@ -309,7 +332,7 @@ async def _handle_pi_camera_query(last_user: str) -> str | None:
             camera_index = 1
         else:
             camera_index = 0
-        return f"__image__://{camera_index}"
+        return f"__image__://{camera_index}?annotated=1"
 
     if "camera 2" in lower or "camera two" in lower:
         camera_index = 1
@@ -1285,7 +1308,8 @@ async def robot_camera(request: Request) -> Any:
     if cam_param.isdigit():
         camera_index = int(cam_param)
 
-    image_b64, err = await _capture_pi_camera_image(camera_index)
+    annotated = (request.query_params.get("annotated") or "").strip().lower() in {"1", "true", "yes", "on"}
+    image_b64, err = await _capture_pi_camera_image(camera_index, annotated=annotated)
     if err or not image_b64:
         raise HTTPException(status_code=502, detail=f"Robot camera unreachable: {err or 'no image returned'}")
 
@@ -1627,9 +1651,10 @@ function add(role, content) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'user' ? 'u' : 'a');
   if (typeof content === 'string' && content.startsWith('__image__://')) {
-    const cam = content.replace('__image__://', '');
+    const snapshot = content.replace('__image__://', '');
+    const [cam, query] = snapshot.split('?', 2);
     const img = document.createElement('img');
-    img.src = `/api/robot/camera?cam=${encodeURIComponent(cam)}&t=${Date.now()}`;
+    img.src = `/api/robot/camera?cam=${encodeURIComponent(cam)}${query ? '&' + query : ''}&t=${Date.now()}`;
     img.alt = 'Camera snapshot';
     img.style.maxWidth = '100%';
     img.style.borderRadius = '10px';
