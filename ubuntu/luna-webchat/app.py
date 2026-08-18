@@ -13,6 +13,7 @@ import tempfile
 import threading
 import zipfile
 import shlex
+import led_controller
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -87,6 +88,13 @@ def _assert_local_url(name: str, value: str, *, allow_empty: bool = False) -> No
 _assert_local_url("OLLAMA_URL", OLLAMA_URL)
 
 
+def _queue_led_reply(reply: str) -> None:
+  if not led_controller.ENABLED:
+    return
+  task = asyncio.create_task(led_controller.display_reply(reply))
+  task.add_done_callback(lambda completed: completed.exception())
+
+
 class Message(BaseModel):
     role: str
     content: str
@@ -109,6 +117,10 @@ class ChatRequest(BaseModel):
 
 class GenRequest(BaseModel):
     prompt: str
+
+
+class LedTextRequest(BaseModel):
+    text: str
 
 
 def _now_iso() -> str:
@@ -1905,17 +1917,20 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
   forced = _identity_reply(last_user)
   if forced is not None:
+    _queue_led_reply(forced)
     return {"reply": forced}
 
   if last_user:
     pi_camera_reply = await _handle_pi_camera_query(last_user)
     if pi_camera_reply is not None:
       await _store_memory(profile, "user", last_user)
+      _queue_led_reply(pi_camera_reply)
       return {"reply": pi_camera_reply}
 
     pc_reply = await _handle_pc_command(profile, last_user)
     if pc_reply is not None:
       await _store_memory(profile, "user", last_user)
+      _queue_led_reply(pc_reply)
       return {"reply": pc_reply}
 
   payload_messages = [
@@ -2073,7 +2088,18 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
   if last_user:
     await _store_memory(profile, "user", last_user)
 
+  _queue_led_reply(reply)
+
   return {"reply": reply}
+
+
+@app.post("/api/led/text")
+async def led_text(req: LedTextRequest) -> dict[str, Any]:
+  if not led_controller.ENABLED:
+    raise HTTPException(status_code=503, detail="LED controller is disabled")
+  if not await led_controller.display_text(req.text):
+    raise HTTPException(status_code=502, detail="LED sign unavailable")
+  return {"ok": True}
 
 
 @app.get("/api/memory/profiles")
