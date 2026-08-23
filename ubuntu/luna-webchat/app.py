@@ -95,6 +95,21 @@ def _queue_led_reply(reply: str) -> None:
   task.add_done_callback(lambda completed: completed.exception())
 
 
+def _queue_led_companion(prompt: str, reply: str) -> None:
+  if not led_controller.ENABLED:
+    return
+  task = asyncio.create_task(led_controller.display_companion(prompt, reply))
+  task.add_done_callback(lambda completed: completed.exception())
+
+
+def _queue_led_request(prompt: str) -> bool:
+  if not led_controller.ENABLED or not led_controller.requested_label(prompt):
+    return False
+  task = asyncio.create_task(led_controller.display_requested(prompt))
+  task.add_done_callback(lambda completed: completed.exception())
+  return True
+
+
 class Message(BaseModel):
     role: str
     content: str
@@ -1425,6 +1440,7 @@ def home() -> HTMLResponse:
           <span class=\"small\" id=\"piStatus\">Pi headless: checking...</span>
           <button class=\"ghost small\" id=\"piMute\" type=\"button\">Mute Pi Mic</button>
           <button class=\"ghost small\" id=\"piPower\" type=\"button\">Arm Power</button>
+          <button class=\"ghost small\" id=\"ledPower\" type=\"button\">LED: unknown</button>
         </div>
         <div class=\"row\">
           <input class=\"small\" id=\"files\" type=\"file\" multiple />
@@ -1457,6 +1473,7 @@ const modelSelect = document.getElementById('modelSelect');
 const piStatus = document.getElementById('piStatus');
 const piMuteBtn = document.getElementById('piMute');
 const piPowerBtn = document.getElementById('piPower');
+const ledPowerBtn = document.getElementById('ledPower');
 const newProfileBtn = document.getElementById('newProfile');
 const webResearch = document.getElementById('webResearch');
 const attachmentsBox = document.getElementById('attachments');
@@ -1492,6 +1509,18 @@ async function controlPi(payload) {
   return data;
 }
 
+async function refreshLedPower() {
+  try {
+    const r = await fetch('/api/led/status');
+    const data = await r.json();
+    ledPowerBtn.textContent = data.power_state === true ? 'LED: ON' : data.power_state === false ? 'LED: OFF' : 'LED: unknown';
+    ledPowerBtn.disabled = false;
+  } catch (_) {
+    ledPowerBtn.textContent = 'LED: unavailable';
+    ledPowerBtn.disabled = true;
+  }
+}
+
 piMuteBtn.addEventListener('click', async () => {
   try {
     const data = await fetch('/api/pi/headless/status').then(r => r.json());
@@ -1508,6 +1537,24 @@ piPowerBtn.addEventListener('click', async () => {
     await refreshPiHeadlessStatus();
   } catch (err) {
     addSystem('Arm power control error: ' + err.message, true);
+  }
+});
+
+ledPowerBtn.addEventListener('click', async () => {
+  try {
+    ledPowerBtn.disabled = true;
+    const status = await fetch('/api/led/status').then(r => r.json());
+    const r = await fetch('/api/led/power', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: status.power_state !== true })
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || 'LED power command failed');
+    await refreshLedPower();
+  } catch (err) {
+    addSystem('LED power error: ' + err.message, true);
+    ledPowerBtn.disabled = false;
   }
 });
 
@@ -1889,7 +1936,9 @@ loadProfiles();
 loadModels();
 setupSpeechRecognition();
 refreshPiHeadlessStatus();
+refreshLedPower();
 setInterval(refreshPiHeadlessStatus, 5000);
+setInterval(refreshLedPower, 5000);
 
 </script>
 </body>
@@ -1917,20 +1966,42 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
   forced = _identity_reply(last_user)
   if forced is not None:
-    _queue_led_reply(forced)
+    if not _queue_led_request(last_user):
+      _queue_led_companion(last_user, forced)
     return {"reply": forced}
 
   if last_user:
+    explicit_led_label = led_controller.requested_label(last_user)
+    if explicit_led_label:
+      led_reply = f"Displaying {explicit_led_label} on the LED."
+      if led_controller.is_nasdaq_request(last_user):
+        quote = await led_controller.fetch_nasdaq_quote()
+        if quote:
+          direction = "up" if float(quote["change"]) >= 0 else "down"
+          led_reply = (
+            f"Nasdaq is {float(quote['price']):,.2f}, {direction} "
+            f"{abs(float(quote['percent'])):.2f}%. Displaying the price on the LED."
+          )
+      elif led_controller.is_weather_request(last_user):
+        weather = await led_controller.fetch_local_weather()
+        if weather:
+          led_reply = f"Local weather is {weather['temp_f']}F with {weather['description']}. Displaying it on the LED."
+      await _store_memory(profile, "user", last_user)
+      _queue_led_request(last_user)
+      return {"reply": led_reply}
+
     pi_camera_reply = await _handle_pi_camera_query(last_user)
     if pi_camera_reply is not None:
       await _store_memory(profile, "user", last_user)
-      _queue_led_reply(pi_camera_reply)
+      if not _queue_led_request(last_user):
+        _queue_led_companion(last_user, pi_camera_reply)
       return {"reply": pi_camera_reply}
 
     pc_reply = await _handle_pc_command(profile, last_user)
     if pc_reply is not None:
       await _store_memory(profile, "user", last_user)
-      _queue_led_reply(pc_reply)
+      if not _queue_led_request(last_user):
+        _queue_led_companion(last_user, pc_reply)
       return {"reply": pc_reply}
 
   payload_messages = [
@@ -2088,7 +2159,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
   if last_user:
     await _store_memory(profile, "user", last_user)
 
-  _queue_led_reply(reply)
+  if not _queue_led_request(last_user):
+    _queue_led_companion(last_user, reply)
 
   return {"reply": reply}
 
@@ -2100,6 +2172,25 @@ async def led_text(req: LedTextRequest) -> dict[str, Any]:
   if not await led_controller.display_text(req.text):
     raise HTTPException(status_code=502, detail="LED sign unavailable")
   return {"ok": True}
+
+
+@app.get("/api/led/status")
+async def led_status() -> dict[str, Any]:
+  return {"ok": led_controller.ENABLED, "power_state": led_controller.power_state()}
+
+
+@app.post("/api/led/power")
+async def led_power(request: Request) -> dict[str, Any]:
+  if not led_controller.ENABLED:
+    raise HTTPException(status_code=503, detail="LED controller is disabled")
+  try:
+    payload = await request.json()
+    on = bool(payload.get("on"))
+  except (ValueError, AttributeError):
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+  if not await led_controller.set_power(on):
+    raise HTTPException(status_code=502, detail="LED sign unavailable")
+  return {"ok": True, "power_state": led_controller.power_state()}
 
 
 @app.get("/api/memory/profiles")

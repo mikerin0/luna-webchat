@@ -431,6 +431,49 @@ def get_current_face_name() -> str:
         return str(_current_face_name)
 
 
+def show_image(path: str, duration_s: float = 0.0):
+    """Display an image file full-screen, then optionally restore the prior face."""
+
+    def _show_image():
+        from PIL import Image
+
+        with _lcd_lock:
+            device = _get_device()
+            if device is None:
+                return
+            global _animated_face_paused_until
+            _animated_face_paused_until = max(_animated_face_paused_until, time.time() + max(0.0, float(duration_s)) + 0.15)
+            restore_face = str(_current_face_name)
+            restore_mode = str(_current_mode_text)
+            try:
+                src = Image.open(str(path)).convert("RGB")
+                # Cover-crop to fill the panel without distorting the aspect ratio.
+                scale = max(device.width / src.width, device.height / src.height)
+                resized = src.resize((round(src.width * scale), round(src.height * scale)), Image.LANCZOS)
+                left = (resized.width - device.width) // 2
+                top = (resized.height - device.height) // 2
+                img = resized.crop((left, top, left + device.width, top + device.height))
+                device.display(img)
+                print(f"[LCD] Showing image: {path}")
+            except Exception as exc:
+                print(f"[LCD] Failed to show image '{path}': {exc}")
+                return
+
+        if duration_s > 0:
+            time.sleep(max(0.0, float(duration_s)))
+            with _lcd_lock:
+                device = _get_device()
+                if device is None:
+                    return
+                try:
+                    _render_animated_face_locked(device, restore_face, restore_mode)
+                    print(f"[LCD] Restored face after image: {restore_face}")
+                except Exception as exc:
+                    print(f"[LCD] Failed restoring face after image: {exc}")
+
+    threading.Thread(target=_show_image, daemon=True).start()
+
+
 def show_text(text: str, duration_s: float = 0.0, font_size: int = 120):
     """Display large centered text, then optionally restore the prior face."""
 

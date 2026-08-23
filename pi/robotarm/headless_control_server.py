@@ -81,6 +81,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
         elif action == "text":
             lcd.show_text(str(payload.get("text", "")), float(payload.get("duration", 2.0)))
+        elif action == "image":
+            lcd.show_image(str(payload.get("path", "")), float(payload.get("duration", 0.0)))
         elif action == "arm_power_on":
             if not brain.power_on_and_rest():
                 self._send(502, {"ok": False, "error": "relay unreachable or rest pose failed"})
