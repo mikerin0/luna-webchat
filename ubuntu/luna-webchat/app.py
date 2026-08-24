@@ -68,6 +68,12 @@ LUNA_PI_DETECT_MIN_CONFIDENCE = float(os.getenv("LUNA_PI_DETECT_MIN_CONFIDENCE",
 LUNA_PI_DETECT_MIN_FRAME_HITS = max(1, int(os.getenv("LUNA_PI_DETECT_MIN_FRAME_HITS", "2")))
 LUNA_PI_DETECT_CLOSEUP_TABLE = os.getenv("LUNA_PI_DETECT_CLOSEUP_TABLE", "true").strip().lower() in {"1", "true", "yes", "on"}
 ESP32_TOKEN = os.getenv("LUNA_ESP32_TOKEN", "").strip()
+ONLINE_AI_ENABLED = os.getenv("LUNA_ONLINE_AI_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+ONLINE_AI_URL = os.getenv("LUNA_ONLINE_AI_URL", "https://api.openai.com/v1/chat/completions").strip()
+ONLINE_AI_API_KEY = os.getenv("LUNA_ONLINE_AI_API_KEY", "").strip()
+ONLINE_AI_MODEL = os.getenv("LUNA_ONLINE_AI_MODEL", "gpt-4o-mini").strip()
+ONLINE_AI_TIMEOUT = float(os.getenv("LUNA_ONLINE_AI_TIMEOUT", "30"))
+_BIG_BROTHER_PHRASE_RE = re.compile(r"\bask\s+(?:your\s+|the\s+)?big\s+brother\b", re.IGNORECASE)
 
 app = FastAPI(title="Luna Local Chat")
 
@@ -78,6 +84,7 @@ _pending_pc_actions: dict[str, dict[str, str]] = {}
 _pending_pc_actions_lock = threading.Lock()
 _lcd_gpu_task: asyncio.Task | None = None
 _esp32_gpu_history: deque[float] = deque(maxlen=60)
+_big_brother_mode = False
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -95,6 +102,28 @@ def _esp32_authorized(request: Request) -> bool:
   supplied = request.headers.get("Authorization", "")
   expected = f"Bearer {ESP32_TOKEN}"
   return bool(ESP32_TOKEN) and hmac.compare_digest(supplied, expected)
+
+
+def _wants_big_brother(text: str) -> bool:
+  return bool(_BIG_BROTHER_PHRASE_RE.search(text or ""))
+
+
+async def _call_online_ai(messages: list[dict[str, Any]]) -> str | None:
+  if not ONLINE_AI_ENABLED or not ONLINE_AI_API_KEY:
+    return None
+  payload = {"model": ONLINE_AI_MODEL, "messages": messages, "stream": False}
+  headers = {"Authorization": f"Bearer {ONLINE_AI_API_KEY}"}
+  try:
+    async with httpx.AsyncClient(timeout=ONLINE_AI_TIMEOUT) as client:
+      r = await client.post(ONLINE_AI_URL, json=payload, headers=headers)
+    if r.status_code != 200:
+      print(f"[BigBrother] online AI error {r.status_code}: {r.text[:300]}")
+      return None
+    data = r.json()
+    return str(data["choices"][0]["message"]["content"]).strip() or None
+  except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+    print(f"[BigBrother] online AI request failed: {exc}")
+    return None
 
 
 _assert_local_url("OLLAMA_URL", OLLAMA_URL)
@@ -180,6 +209,7 @@ class ChatRequest(BaseModel):
   messages: list[Message]
   attachments: list[Attachment] = []
   web_research: bool = False
+  online_ai: bool = False
   profile: str = "general"
   model: str | None = None
 
@@ -1438,6 +1468,7 @@ async def esp32_status(request: Request) -> dict[str, Any]:
     "speaking": pi_status.get("speaking"),
     "pi_online": bool(pi_status.get("ok")),
     "led_power": led_controller.power_state(),
+    "big_brother_mode": _big_brother_mode,
   }
 
 
@@ -1450,6 +1481,10 @@ async def esp32_action(request: Request) -> dict[str, Any]:
   except ValueError as exc:
     raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
   action = str(payload.get("action", "")).strip().lower() if isinstance(payload, dict) else ""
+  if action in {"big_brother_on", "big_brother_off"}:
+    global _big_brother_mode
+    _big_brother_mode = action == "big_brother_on"
+    return {"ok": True, "action": action, "big_brother_mode": _big_brother_mode}
   if action not in {"mute", "unmute"}:
     raise HTTPException(status_code=400, detail="Unsupported ESP32 action")
   result = await _pi_headless_request("POST", {"action": action})
@@ -1608,6 +1643,7 @@ const piPowerBtn = document.getElementById('piPower');
 const ledPowerBtn = document.getElementById('ledPower');
 const newProfileBtn = document.getElementById('newProfile');
 const webResearch = document.getElementById('webResearch');
+const bigBrother = document.getElementById('bigBrother');
 const attachmentsBox = document.getElementById('attachments');
 let recognition = null;
 let micListening = false;
@@ -2045,6 +2081,7 @@ form.addEventListener('submit', async (e) => {
         messages: turnMessages,
         attachments,
         web_research: !!webResearch.checked,
+        online_ai: !!bigBrother.checked,
         profile: (profileSelect.value || 'general').trim() || 'general',
         model: (modelSelect.value || '').trim() || null
       })
@@ -2259,56 +2296,76 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
   payload_messages.extend(converted)
 
-  payload = {
-    "model": selected_model,
-    "messages": payload_messages,
-    "stream": False,
-  }
-
-  try:
-    async with httpx.AsyncClient(timeout=180) as client:
-      r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-  except httpx.HTTPError as exc:
-    raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}") from exc
-
-  if r.status_code != 200:
-    raise HTTPException(status_code=502, detail=f"Ollama error {r.status_code}: {r.text[:300]}")
-
-  data = r.json()
-  reply = data.get("message", {}).get("content", "")
-
-  # One-shot correction path: if research was supplied but the model still claims
-  # it cannot browse, force a retry with explicit instruction.
-  if research_ctx and re.search(
-    r"\b(cannot|can't|do not|don't)\b.{0,40}\b(access|browse)\b.{0,20}\binternet\b",
-    reply.lower(),
-  ):
-    retry_messages = list(payload_messages)
-    retry_messages.append(
+  want_big_brother = bool(req.online_ai) or _big_brother_mode or (bool(last_user) and _wants_big_brother(last_user))
+  reply = ""
+  if want_big_brother:
+    big_brother_messages = payload_messages + [
       {
         "role": "system",
         "content": (
-          "Correction: web findings were already retrieved and provided above. "
-          "Do not mention inability to access internet. "
-          "Provide the best answer from those findings and include source URLs."
+          "\"Big Brother\" is this system's internal nickname for you, a more capable online AI model that "
+          "Mike's local assistant Luna escalates hard questions to. Do not comment on the phrase \"big brother\" "
+          "or say you have no such person; just answer the underlying question directly as Luna's online backup."
         ),
       }
-    )
-    retry_payload = {
+    ]
+    reply = await _call_online_ai(big_brother_messages) or ""
+    if reply:
+      reply = "This is Big Brother. " + reply
+    else:
+      want_big_brother = False
+
+  if not want_big_brother:
+    payload = {
       "model": selected_model,
-      "messages": retry_messages,
+      "messages": payload_messages,
       "stream": False,
     }
+
     try:
       async with httpx.AsyncClient(timeout=180) as client:
-        rr = await client.post(f"{OLLAMA_URL}/api/chat", json=retry_payload)
-      if rr.status_code == 200:
-        retry_data = rr.json()
-        retry_reply = retry_data.get("message", {}).get("content", "").strip()
-        if retry_reply:
-          reply = retry_reply
-    except httpx.HTTPError:
-      pass
+        r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+    except httpx.HTTPError as exc:
+      raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}") from exc
+
+    if r.status_code != 200:
+      raise HTTPException(status_code=502, detail=f"Ollama error {r.status_code}: {r.text[:300]}")
+
+    data = r.json()
+    reply = data.get("message", {}).get("content", "")
+
+    # One-shot correction path: if research was supplied but the model still claims
+    # it cannot browse, force a retry with explicit instruction.
+    if research_ctx and re.search(
+      r"\b(cannot|can't|do not|don't)\b.{0,40}\b(access|browse)\b.{0,20}\binternet\b",
+      reply.lower(),
+    ):
+      retry_messages = list(payload_messages)
+      retry_messages.append(
+        {
+          "role": "system",
+          "content": (
+            "Correction: web findings were already retrieved and provided above. "
+            "Do not mention inability to access internet. "
+            "Provide the best answer from those findings and include source URLs."
+          ),
+        }
+      )
+      retry_payload = {
+        "model": selected_model,
+        "messages": retry_messages,
+        "stream": False,
+      }
+      try:
+        async with httpx.AsyncClient(timeout=180) as client:
+          rr = await client.post(f"{OLLAMA_URL}/api/chat", json=retry_payload)
+        if rr.status_code == 200:
+          retry_data = rr.json()
+          retry_reply = retry_data.get("message", {}).get("content", "").strip()
+          if retry_reply:
+            reply = retry_reply
+      except httpx.HTTPError:
+        pass
 
   if last_user:
     await _store_memory(profile, "user", last_user)

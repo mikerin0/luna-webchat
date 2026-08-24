@@ -7,10 +7,10 @@
 #include <esp_heap_caps.h>
 
 // Set these for the Wi-Fi network and Luna server.
-const char *WIFI_SSID = "YOUR_WIFI_NAME";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char *WIFI_SSID = "HOME-4B02";
+const char *WIFI_PASSWORD = "ROTATED-WIFI-PASSWORD-REDACTED";
 const char *LUNA_URL = "https://172.31.31.106:3010";
-const char *LUNA_TOKEN = "YOUR_ESP32_TOKEN";
+const char *LUNA_TOKEN = "ROTATED-SECRET-REDACTED";
 
 static const uint16_t SCREEN_WIDTH = 480;
 static const uint16_t SCREEN_HEIGHT = 320;
@@ -25,9 +25,11 @@ static lv_obj_t *gpu_label;
 static lv_obj_t *memory_label;
 static lv_obj_t *status_label;
 static lv_obj_t *mute_button_label;
+static lv_obj_t *big_brother_button_label;
 static lv_obj_t *gpu_chart;
 static lv_chart_series_t *gpu_series;
 static bool mic_muted = false;
+static bool big_brother_mode = false;
 static uint32_t last_poll_ms = 0;
 
 void display_flush(lv_disp_drv_t *display, const lv_area_t *area, lv_color_t *color_p) {
@@ -92,6 +94,10 @@ void update_mute_button() {
   lv_label_set_text(mute_button_label, mic_muted ? "UNMUTE MIKE" : "MUTE MIKE");
 }
 
+void update_big_brother_button() {
+  lv_label_set_text(big_brother_button_label, big_brother_mode ? "BIG BRO: ON" : "BIG BRO: OFF");
+}
+
 void refresh_dashboard() {
   String response;
   if (!luna_request("GET", "/api/esp32/status", "", response)) {
@@ -115,6 +121,8 @@ void refresh_dashboard() {
 
   mic_muted = document["mic_muted"].as<bool>();
   update_mute_button();
+  big_brother_mode = document["big_brother_mode"].as<bool>();
+  update_big_brother_button();
   set_status("LUNA ONLINE", lv_palette_main(LV_PALETTE_GREEN));
 
   JsonArray history = document["gpu_history"].as<JsonArray>();
@@ -139,6 +147,22 @@ void mute_button_event(lv_event_t *event) {
   mic_muted = target_muted;
   update_mute_button();
   set_status(mic_muted ? "MIKE MUTED" : "MIKE LISTENING", lv_palette_main(LV_PALETTE_GREEN));
+}
+
+void big_brother_button_event(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+  bool target_mode = !big_brother_mode;
+  String body = String("{\"action\":\"") + (target_mode ? "big_brother_on" : "big_brother_off") + "\"}";
+  String response;
+  if (!luna_request("POST", "/api/esp32/action", body, response)) {
+    set_status("BIG BROTHER ACTION FAILED", lv_palette_main(LV_PALETTE_RED));
+    return;
+  }
+  big_brother_mode = target_mode;
+  update_big_brother_button();
+  set_status(big_brother_mode ? "BIG BROTHER ENABLED" : "BIG BROTHER DISABLED", lv_palette_main(LV_PALETTE_GREEN));
 }
 
 void make_dashboard() {
@@ -183,6 +207,14 @@ void make_dashboard() {
   mute_button_label = lv_label_create(mute_button);
   lv_obj_center(mute_button_label);
   update_mute_button();
+
+  lv_obj_t *big_brother_button = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(big_brother_button, 125, 55);
+  lv_obj_align(big_brother_button, LV_ALIGN_TOP_RIGHT, -20, 175);
+  lv_obj_add_event_cb(big_brother_button, big_brother_button_event, LV_EVENT_ALL, NULL);
+  big_brother_button_label = lv_label_create(big_brother_button);
+  lv_obj_center(big_brother_button_label);
+  update_big_brother_button();
 
   status_label = lv_label_create(lv_scr_act());
   lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -12);
