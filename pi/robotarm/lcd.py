@@ -485,7 +485,9 @@ def show_text(text: str, duration_s: float = 0.0, font_size: int = 120):
             if device is None:
                 return
             global _animated_face_paused_until
-            _animated_face_paused_until = max(_animated_face_paused_until, time.time() + max(0.0, float(duration_s)) + 0.15)
+            persistent = float(duration_s) < 0
+            pause_until = float("inf") if persistent else time.time() + max(0.0, float(duration_s)) + 0.15
+            _animated_face_paused_until = max(_animated_face_paused_until, pause_until)
             restore_face = str(_current_face_name)
             restore_mode = str(_current_mode_text)
             try:

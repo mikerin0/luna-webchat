@@ -80,7 +80,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "invalid emotion"})
                 return
         elif action == "text":
-            lcd.show_text(str(payload.get("text", "")), float(payload.get("duration", 2.0)))
+            lcd.show_text(
+                str(payload.get("text", "")),
+                float(payload.get("duration", 2.0)),
+                int(payload.get("font_size", 120)),
+            )
         elif action == "image":
             lcd.show_image(str(payload.get("path", "")), float(payload.get("duration", 0.0)))
         elif action == "arm_power_on":

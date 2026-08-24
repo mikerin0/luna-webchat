@@ -13,6 +13,8 @@ import tempfile
 import threading
 import zipfile
 import shlex
+import hmac
+from collections import deque
 import led_controller
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,7 @@ MEMORY_TOP_K = int(os.getenv("LUNA_MEMORY_TOP_K", "6"))
 MEMORY_MAX_CHARS = int(os.getenv("LUNA_MEMORY_MAX_CHARS", "1800"))
 MEMORY_RECENT_K = int(os.getenv("LUNA_MEMORY_RECENT_K", "6"))
 MEMORY_MIN_SIMILARITY = float(os.getenv("LUNA_MEMORY_MIN_SIMILARITY", "0.22"))
+BOOK_MIN_SIMILARITY = float(os.getenv("LUNA_BOOK_MIN_SIMILARITY", "0.45"))
 BOOK_CHUNK_SIZE = int(os.getenv("LUNA_BOOK_CHUNK_SIZE", "1800"))
 BOOK_CHUNK_OVERLAP = int(os.getenv("LUNA_BOOK_CHUNK_OVERLAP", "220"))
 BOOK_SEMANTIC_SCAN_LIMIT = int(os.getenv("LUNA_BOOK_SEMANTIC_SCAN_LIMIT", "1200"))
@@ -64,6 +67,7 @@ LUNA_PI_DETECT_FRAMES = max(1, int(os.getenv("LUNA_PI_DETECT_FRAMES", "8")))
 LUNA_PI_DETECT_MIN_CONFIDENCE = float(os.getenv("LUNA_PI_DETECT_MIN_CONFIDENCE", "0.20"))
 LUNA_PI_DETECT_MIN_FRAME_HITS = max(1, int(os.getenv("LUNA_PI_DETECT_MIN_FRAME_HITS", "2")))
 LUNA_PI_DETECT_CLOSEUP_TABLE = os.getenv("LUNA_PI_DETECT_CLOSEUP_TABLE", "true").strip().lower() in {"1", "true", "yes", "on"}
+ESP32_TOKEN = os.getenv("LUNA_ESP32_TOKEN", "").strip()
 
 app = FastAPI(title="Luna Local Chat")
 
@@ -72,6 +76,8 @@ _memory_conn = sqlite3.connect(MEMORY_DB_PATH, check_same_thread=False)
 _memory_conn.row_factory = sqlite3.Row
 _pending_pc_actions: dict[str, dict[str, str]] = {}
 _pending_pc_actions_lock = threading.Lock()
+_lcd_gpu_task: asyncio.Task | None = None
+_esp32_gpu_history: deque[float] = deque(maxlen=60)
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -83,6 +89,12 @@ def _assert_local_url(name: str, value: str, *, allow_empty: bool = False) -> No
     host = parsed.hostname
     if parsed.scheme not in {"http", "https"} or host not in _LOCAL_HOSTS:
         raise RuntimeError(f"{name} must be a local URL (localhost/127.0.0.1). Got: {value}")
+
+
+def _esp32_authorized(request: Request) -> bool:
+  supplied = request.headers.get("Authorization", "")
+  expected = f"Bearer {ESP32_TOKEN}"
+  return bool(ESP32_TOKEN) and hmac.compare_digest(supplied, expected)
 
 
 _assert_local_url("OLLAMA_URL", OLLAMA_URL)
@@ -105,9 +117,51 @@ def _queue_led_companion(prompt: str, reply: str) -> None:
 def _queue_led_request(prompt: str) -> bool:
   if not led_controller.ENABLED or not led_controller.requested_label(prompt):
     return False
+  _cancel_lcd_gpu_monitor()
   task = asyncio.create_task(led_controller.display_requested(prompt))
   task.add_done_callback(lambda completed: completed.exception())
   return True
+
+
+def _lcd_request(prompt: str) -> bool:
+  text = (prompt or "").lower()
+  return bool(re.search(r"\b(lcd|2[- ]inch|small screen)\b", text))
+
+
+def _queue_lcd_gpu_monitor() -> None:
+  global _lcd_gpu_task
+  led_controller.stop_gpu_mode()
+  if _lcd_gpu_task is not None and not _lcd_gpu_task.done():
+    return
+
+  async def monitor() -> None:
+    global _lcd_gpu_task
+    last_displayed = None
+    try:
+      while True:
+        usage = _gpu_usage_percent()
+        displayed = "GPU N/A" if usage is None else f"GPU {usage:.0f}%"
+        if displayed != last_displayed:
+          result = await _pi_headless_request(
+            "POST",
+            {"action": "text", "text": displayed, "duration": -1, "font_size": 72},
+          )
+          if result.get("ok", True):
+            last_displayed = displayed
+        await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+      pass
+    finally:
+      _lcd_gpu_task = None
+
+  _lcd_gpu_task = asyncio.create_task(monitor())
+
+
+def _cancel_lcd_gpu_monitor() -> None:
+  global _lcd_gpu_task
+  if _lcd_gpu_task is not None and not _lcd_gpu_task.done():
+    _lcd_gpu_task.cancel()
+  _lcd_gpu_task = None
 
 
 class Message(BaseModel):
@@ -836,7 +890,7 @@ async def _memory_context(profile: str, query: str, limit: int) -> str:
             if not isinstance(emb_vec, list):
                 continue
             sim = _cosine_similarity(query_emb, [float(x) for x in emb_vec])
-            if sim >= MEMORY_MIN_SIMILARITY:
+            if sim >= BOOK_MIN_SIMILARITY:
                 scored.append(
                     (
                         sim,
@@ -1002,6 +1056,23 @@ async def _cpu_usage_percent(sample_delay: float = 0.12) -> float | None:
   return max(0.0, min(100.0, usage))
 
 
+def _gpu_usage_percent() -> float | None:
+  try:
+    result = subprocess.run(
+      ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+      capture_output=True,
+      text=True,
+      timeout=2,
+      check=False,
+    )
+    values = [float(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+    if not values:
+      return None
+    return round(max(0.0, min(100.0, sum(values) / len(values))), 1)
+  except (OSError, ValueError, subprocess.SubprocessError):
+    return None
+
+
 def _temperature_readings() -> list[dict[str, Any]]:
   readings: list[dict[str, Any]] = []
 
@@ -1063,6 +1134,7 @@ def _temperature_readings() -> list[dict[str, Any]]:
 
 async def _server_stats() -> dict[str, Any]:
   cpu = await _cpu_usage_percent()
+  gpu = _gpu_usage_percent()
   disk = shutil.disk_usage("/")
   disk_used_pct = round((disk.used / (disk.total or 1)) * 100.0, 1)
   temps = _temperature_readings()
@@ -1082,6 +1154,8 @@ async def _server_stats() -> dict[str, Any]:
 
   return {
     "cpu_percent": None if cpu is None else round(cpu, 1),
+    "gpu_percent": gpu,
+    "memory_free_gb": _mem_info_gb()[1],
     "disk_total_gb": round(disk.total / (1024 ** 3), 1),
     "disk_used_gb": round(disk.used / (1024 ** 3), 1),
     "disk_free_gb": round(disk.free / (1024 ** 3), 1),
@@ -1101,6 +1175,11 @@ def _server_monitoring_requested(text: str) -> bool:
   has_monitoring_intent = bool(re.search(r"\b(what|how|show|check|watch|monitor|current|right now|status)\b", q))
   has_server_context = bool(re.search(r"\b(server|linux|machine|host|system|this box|this server)\b", q))
   return has_stats_words and (has_monitoring_intent or has_server_context)
+
+
+def _linux_stats_requested(text: str) -> bool:
+  q = (text or "").lower().strip()
+  return bool(re.search(r"\b(show|give|tell|check|get)\b", q) and re.search(r"\blinux\s+stats?\b", q))
 
 
 def _mem_info_gb() -> tuple[float | None, float | None]:
@@ -1151,6 +1230,8 @@ async def _server_stats_context() -> str:
   return (
     "Current Linux server stats for this host. Use these facts directly when answering the user:\n"
     f"- CPU usage: {stats.get('cpu_percent', 'unavailable')}%\n"
+    f"- GPU usage: {stats.get('gpu_percent', 'unavailable')}%\n"
+    f"- Free memory: {stats.get('memory_free_gb', 'unavailable')} GB\n"
     f"- Disk usage on /: {stats.get('disk_used_percent', 'unavailable')}% used "
     f"({stats.get('disk_used_gb', 'unavailable')} GB used / {stats.get('disk_total_gb', 'unavailable')} GB total)\n"
     f"- Temperatures: {temp_lines}\n"
@@ -1158,6 +1239,17 @@ async def _server_stats_context() -> str:
     f"- Uptime: {uptime_text}\n"
     "If a value is unavailable, say so plainly instead of guessing."
   )
+
+
+async def _linux_stats_reply() -> str:
+  stats = await _server_stats()
+  cpu = stats.get("cpu_percent")
+  gpu = stats.get("gpu_percent")
+  memory = stats.get("memory_free_gb")
+  cpu_text = "unavailable" if cpu is None else f"{cpu:.1f}%"
+  gpu_text = "unavailable" if gpu is None else f"{gpu:.1f}%"
+  memory_text = "unavailable" if memory is None else f"{memory:.1f} GB"
+  return f"Linux stats: CPU {cpu_text}, GPU {gpu_text}, free memory {memory_text}."
 
 
 def _pc_help_text() -> str:
@@ -1324,6 +1416,46 @@ def health() -> dict[str, bool]:
 @app.get("/api/system/stats")
 async def system_stats() -> dict[str, Any]:
   return await _server_stats()
+
+
+@app.get("/api/esp32/status")
+async def esp32_status(request: Request) -> dict[str, Any]:
+  if not _esp32_authorized(request):
+    raise HTTPException(status_code=401, detail="ESP32 authorization required")
+  stats = await _server_stats()
+  gpu = stats.get("gpu_percent")
+  if gpu is not None:
+    _esp32_gpu_history.append(float(gpu))
+  pi_status = await _pi_headless_request()
+  return {
+    "ok": True,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "cpu_percent": stats.get("cpu_percent"),
+    "gpu_percent": gpu,
+    "memory_free_gb": stats.get("memory_free_gb"),
+    "gpu_history": list(_esp32_gpu_history),
+    "mic_muted": pi_status.get("mic_muted"),
+    "speaking": pi_status.get("speaking"),
+    "pi_online": bool(pi_status.get("ok")),
+    "led_power": led_controller.power_state(),
+  }
+
+
+@app.post("/api/esp32/action")
+async def esp32_action(request: Request) -> dict[str, Any]:
+  if not _esp32_authorized(request):
+    raise HTTPException(status_code=401, detail="ESP32 authorization required")
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  action = str(payload.get("action", "")).strip().lower() if isinstance(payload, dict) else ""
+  if action not in {"mute", "unmute"}:
+    raise HTTPException(status_code=400, detail="Unsupported ESP32 action")
+  result = await _pi_headless_request("POST", {"action": action})
+  if not result.get("ok", False):
+    raise HTTPException(status_code=502, detail=result.get("error", "Pi action failed"))
+  return {"ok": True, "action": action, "mic_muted": result.get("mic_muted")}
 
 
 async def _pi_headless_request(method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1971,6 +2103,24 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     return {"reply": forced}
 
   if last_user:
+    if _linux_stats_requested(last_user):
+      reply = await _linux_stats_reply()
+      await _store_memory(profile, "user", last_user)
+      await _store_memory(profile, "assistant", reply)
+      return {"reply": reply}
+
+    if _lcd_request(last_user) and led_controller.is_gpu_request(last_user):
+      lcd_reply = "Showing live GPU usage on the LCD. It will update every few seconds until another display command replaces it."
+      await _store_memory(profile, "user", last_user)
+      _queue_lcd_gpu_monitor()
+      return {"reply": lcd_reply}
+
+    if led_controller.is_gpu_request(last_user):
+      led_reply = "Showing live GPU usage on the LED. It will update every few seconds until another LED command replaces it."
+      await _store_memory(profile, "user", last_user)
+      _queue_led_request(last_user)
+      return {"reply": led_reply}
+
     explicit_led_label = led_controller.requested_label(last_user)
     if explicit_led_label:
       led_reply = f"Displaying {explicit_led_label} on the LED."
@@ -1986,6 +2136,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         weather = await led_controller.fetch_local_weather()
         if weather:
           led_reply = f"Local weather is {weather['temp_f']}F with {weather['description']}. Displaying it on the LED."
+      elif led_controller.is_clock_request(last_user):
+        led_reply = "Showing a live clock on the LED. It will stay on until another LED command replaces it."
       await _store_memory(profile, "user", last_user)
       _queue_led_request(last_user)
       return {"reply": led_reply}
@@ -2027,6 +2179,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         "Supported actions include opening apps or URLs, running PowerShell commands, and reading or writing files within allowed Windows folders. "
         "Speech-friendly phrases like 'Luna, open notepad on the PC', 'Luna cancel', and 'Never mind' are valid control phrases. "
         "Persistent conversation memory is enabled. Use the supplied memory context and recent memories when answering questions about what you remember, and say that you remember relevant past conversations when memory context supports it."
+          " Book excerpts are reference material, not web research. Do not cite or attribute URLs found inside book excerpts as web sources."
       ),
     },
   ]
@@ -2065,6 +2218,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
           "You have already been provided current web findings in the system context for this turn. "
           "Do not say you cannot access or browse the internet. "
           "Answer using the provided findings and cite source URLs you used."
+          " Only cite URLs from the explicitly labeled Web research findings; never cite URLs found in book excerpts or conversation memory."
         ),
       }
     )
