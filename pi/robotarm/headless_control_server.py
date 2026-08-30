@@ -13,6 +13,7 @@ import voice_assistant
 HOST = os.getenv("LUNA_HEADLESS_HOST", "0.0.0.0")
 PORT = int(os.getenv("LUNA_HEADLESS_PORT", "8004"))
 TOKEN = os.getenv("LUNA_HEADLESS_TOKEN", "").strip()
+ARM_POWER_OFF_ON_START = os.getenv("LUNA_ARM_POWER_OFF_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"}
 _server: ThreadingHTTPServer | None = None
 
 
@@ -115,6 +116,8 @@ def start_server() -> ThreadingHTTPServer:
     global _server
     if _server is not None:
         return _server
+    if ARM_POWER_OFF_ON_START:
+        brain.set_servo_power(False)
     _server = ThreadingHTTPServer((HOST, PORT), _Handler)
     threading.Thread(target=_server.serve_forever, daemon=True, name="HeadlessControlHTTP").start()
     print(f"[Headless] Control server listening on {HOST}:{PORT}")

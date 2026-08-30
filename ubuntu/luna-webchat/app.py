@@ -259,6 +259,7 @@ async def _capture_pi_camera_image(camera_index: int, annotated: bool = False) -
       )
     cmd = (
       f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no "
+      "-o PubkeyAuthentication=no -o PreferredAuthentications=password "
       f"{shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} {shlex.quote(remote_command)}"
     )
     try:
@@ -267,7 +268,9 @@ async def _capture_pi_camera_image(camera_index: int, annotated: bool = False) -
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+    except asyncio.TimeoutError:
+        return None, "Pi camera capture timed out."
     except Exception as exc:
         return None, f"Failed to contact Pi camera host: {exc}"
 
@@ -294,6 +297,7 @@ async def _analyze_pi_camera_with_pi_hailo(camera_index: int) -> tuple[str | Non
   )
   ssh_command = (
     f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no "
+    "-o PubkeyAuthentication=no -o PreferredAuthentications=password "
     f"{shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} {shlex.quote(command)}"
   )
   try:
@@ -302,7 +306,7 @@ async def _analyze_pi_camera_with_pi_hailo(camera_index: int) -> tuple[str | Non
       stdout=asyncio.subprocess.PIPE,
       stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
   except asyncio.TimeoutError:
     return None, "Pi Hailo object detection timed out."
   except Exception as exc:
@@ -406,7 +410,7 @@ async def _legacy_analyze_pi_camera_with_hailo(camera_index: int) -> tuple[str |
     remote_script = f"cat > {script_path} <<'PY'\n{script_body}PY\npython3 {script_path}\n"
 
     cmd = (
-        f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no {shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} "
+        f"sshpass -p {shlex.quote(LUNA_PI_PASSWORD)} ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -o PreferredAuthentications=password {shlex.quote(LUNA_PI_USER)}@{shlex.quote(LUNA_PI_HOST)} "
         f"'source {shlex.quote(LUNA_PI_VENV)} && rm -f /tmp/luna_cam_{camera_index}.jpg /tmp/luna_cam_{camera_index}.txt {script_path} && "
         f"rpicam-jpeg --camera {camera_index} --width 640 --height 360 --output /tmp/luna_cam_{camera_index}.jpg --timeout 500 >/tmp/luna_cam_{camera_index}.log 2>&1 && "
         f"{remote_script}'"
@@ -432,29 +436,30 @@ async def _legacy_analyze_pi_camera_with_hailo(camera_index: int) -> tuple[str |
 
 
 async def _handle_pi_camera_query(last_user: str) -> str | None:
-    lower = last_user.strip().lower()
-    if "camera 1" not in lower and "camera one" not in lower and "camera 2" not in lower and "camera two" not in lower:
-        return None
+  lower = last_user.strip().lower()
+  has_camera_ref = bool(re.search(r"\b(camera|cam|snapshot|photo|picture|image|see|seeing|sees|look|looking|view)\b", lower))
+  wants_snapshot = bool(re.search(r"\b(snapshot|photo|picture|image|still|show me|show|view)\b", lower))
+  wants_description = bool(re.search(r"\b(describe|what.*see|what.*seeing|what.*sees|look.*at|identify|recognize|analyse|analyze)\b", lower))
+  if not has_camera_ref or not (wants_snapshot or wants_description):
+    return None
 
-    if "snapshot" in lower:
-        if "camera 2" in lower or "camera two" in lower:
-            camera_index = 1
-        else:
-            camera_index = 0
-        return f"__image__://{camera_index}?annotated=1"
+  if "camera 2" in lower or "camera two" in lower or "cam 2" in lower or "cam two" in lower:
+    camera_index = 1
+  else:
+    camera_index = 0
 
-    if "camera 2" in lower or "camera two" in lower:
-        camera_index = 1
-    else:
-        camera_index = 0
+  if wants_snapshot and not wants_description:
+    return f"__image__://{camera_index}?annotated=1"
 
-    result, err = await _analyze_pi_camera_with_hailo(camera_index)
-    if err:
-        return f"I couldn't access the Pi camera feed: {err}"
+  result, err = await _analyze_pi_camera_with_hailo(camera_index)
+  if err:
+    if "timed out" in err.lower():
+      return f"__image__://{camera_index}?annotated=0"
+    return f"I couldn't access the Pi camera feed: {err}"
 
-    if result.startswith("Pi camera") and "scene:" in result:
-        return result.split("scene:", 1)[1].strip()
-    return result
+  if result.startswith("Pi camera") and "scene:" in result:
+    return result.split("scene:", 1)[1].strip()
+  return result
 
 
 def _init_memory_db() -> None:
@@ -842,12 +847,15 @@ async def _memory_context(profile: str, query: str, limit: int) -> str:
     or re.search(r"\b(i|me)\b.*\b(name|favorite|favourite|color|colour|age|birthday|goal|preference)\b", q_lower)
   )
   allow_chat_memory = allow_chat_memory or asks_personal_fact
+  allow_book_context = bool(
+    re.search(r"\b(book|books|ingested|document|source|chapter|excerpt|guitar|guitars|fret|chord|strings?|dummies)\b", q_lower)
+  )
 
   query_emb = await _embed_text(q)
 
   if query_emb is None:
     chat_rows = _lexical_memory_fallback(profile_key, q, limit) if allow_chat_memory else []
-    book_rows = _book_lexical_fallback(profile_key, q, limit)
+    book_rows = _book_lexical_fallback(profile_key, q, limit) if allow_book_context else []
 
     snippets: list[str] = []
     chat_cap = max(2, limit // 2)
@@ -884,17 +892,20 @@ async def _memory_context(profile: str, query: str, limit: int) -> str:
     else:
       mem_rows = []
 
-    book_cur = _memory_conn.execute(
-      """
-      SELECT source_name, chunk_index, content, embedding, created_at
-      FROM book_chunks
-      WHERE profile = ?
-      ORDER BY id DESC
-      LIMIT ?
-      """,
-      (profile_key, BOOK_SEMANTIC_SCAN_LIMIT),
-    )
-    book_rows = list(book_cur.fetchall())
+    if allow_book_context:
+      book_cur = _memory_conn.execute(
+        """
+        SELECT source_name, chunk_index, content, embedding, created_at
+        FROM book_chunks
+        WHERE profile = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (profile_key, BOOK_SEMANTIC_SCAN_LIMIT),
+      )
+      book_rows = list(book_cur.fetchall())
+    else:
+      book_rows = []
 
     scored: list[tuple[float, str]] = []
     for row in mem_rows:
@@ -1615,6 +1626,10 @@ def home() -> HTMLResponse:
             <input id=\"webResearch\" type=\"checkbox\" />
             Web research
           </label>
+          <label class=\"small\" style=\"display:flex;align-items:center;gap:6px;border:1px solid #d8cdbd;border-radius:10px;padding:8px 10px;background:#fff8ec;white-space:nowrap;\">
+            <input id=\"bigBrother\" type=\"checkbox\" />
+            Ask Big Brother
+          </label>
         </div>
         <div class=\"row\">
           <input class=\"small\" id=\"bookFile\" type=\"file\" accept=\".txt,.md,.markdown,.epub,.pdf,.mobi,.azw,.azw3\" />
@@ -2080,8 +2095,8 @@ form.addEventListener('submit', async (e) => {
       body: JSON.stringify({
         messages: turnMessages,
         attachments,
-        web_research: !!webResearch.checked,
-        online_ai: !!bigBrother.checked,
+        web_research: !!webResearch?.checked,
+        online_ai: !!bigBrother?.checked,
         profile: (profileSelect.value || 'general').trim() || 'general',
         model: (modelSelect.value || '').trim() || null
       })

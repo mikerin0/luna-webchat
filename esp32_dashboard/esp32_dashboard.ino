@@ -225,6 +225,9 @@ void setup() {
   Serial.begin(115200);
   my_lcd.init();
   my_lcd.setRotation(1);
+  // Touch calibration for this panel at rotation 1; without it the axes map inverted.
+  uint16_t calData[5] = { 254, 3643, 176, 3693, 7 };
+  my_lcd.setTouch(calData);
   my_lcd.fillScreen(TFT_BLACK);
 
   lv_init();
