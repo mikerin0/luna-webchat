@@ -1479,6 +1479,7 @@ async def esp32_status(request: Request) -> dict[str, Any]:
     "speaking": pi_status.get("speaking"),
     "pi_online": bool(pi_status.get("ok")),
     "led_power": led_controller.power_state(),
+    "lcd_backlight": pi_status.get("lcd_backlight"),
     "big_brother_mode": _big_brother_mode,
   }
 
@@ -1496,6 +1497,16 @@ async def esp32_action(request: Request) -> dict[str, Any]:
     global _big_brother_mode
     _big_brother_mode = action == "big_brother_on"
     return {"ok": True, "action": action, "big_brother_mode": _big_brother_mode}
+  if action in {"led_on", "led_off"}:
+    on = action == "led_on"
+    if not await led_controller.set_power(on):
+      raise HTTPException(status_code=502, detail="LED sign unavailable")
+    return {"ok": True, "action": action, "led_power": led_controller.power_state()}
+  if action in {"lcd_on", "lcd_off"}:
+    result = await _pi_headless_request("POST", {"action": action})
+    if not result.get("ok", False):
+      raise HTTPException(status_code=502, detail=result.get("error", "Pi LCD action failed"))
+    return {"ok": True, "action": action, "lcd_backlight": result.get("lcd_backlight")}
   if action not in {"mute", "unmute"}:
     raise HTTPException(status_code=400, detail="Unsupported ESP32 action")
   result = await _pi_headless_request("POST", {"action": action})

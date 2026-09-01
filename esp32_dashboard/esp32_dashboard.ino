@@ -12,6 +12,9 @@ const char *WIFI_PASSWORD = "ROTATED-WIFI-PASSWORD-REDACTED";
 const char *LUNA_URL = "https://172.31.31.106:3010";
 const char *LUNA_TOKEN = "ROTATED-SECRET-REDACTED";
 
+// Backlight enable pin for this ESP32-32E module (per board pinout).
+static const int TFT_BACKLIGHT_PIN = 27;
+
 static const uint16_t SCREEN_WIDTH = 480;
 static const uint16_t SCREEN_HEIGHT = 320;
 static const uint32_t POLL_INTERVAL_MS = 2000;
@@ -26,10 +29,13 @@ static lv_obj_t *memory_label;
 static lv_obj_t *status_label;
 static lv_obj_t *mute_button_label;
 static lv_obj_t *big_brother_button_label;
+static lv_obj_t *blank_button_label;
+static lv_obj_t *blank_overlay;
 static lv_obj_t *gpu_chart;
 static lv_chart_series_t *gpu_series;
 static bool mic_muted = false;
 static bool big_brother_mode = false;
+static bool blanked_mode = false;
 static uint32_t last_poll_ms = 0;
 
 void display_flush(lv_disp_drv_t *display, const lv_area_t *area, lv_color_t *color_p) {
@@ -98,17 +104,47 @@ void update_big_brother_button() {
   lv_label_set_text(big_brother_button_label, big_brother_mode ? "BIG BRO: ON" : "BIG BRO: OFF");
 }
 
+void enter_blank_mode() {
+  pinMode(TFT_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT_PIN, LOW);
+
+  String response;
+  luna_request("POST", "/api/esp32/action", "{\"action\":\"led_off\"}", response);
+  luna_request("POST", "/api/esp32/action", "{\"action\":\"lcd_off\"}", response);
+
+  blanked_mode = true;
+  lv_obj_clear_flag(blank_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(blank_overlay);
+}
+
+void exit_blank_mode() {
+  pinMode(TFT_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT_PIN, HIGH);
+
+  String response;
+  luna_request("POST", "/api/esp32/action", "{\"action\":\"led_on\"}", response);
+  luna_request("POST", "/api/esp32/action", "{\"action\":\"lcd_on\"}", response);
+
+  blanked_mode = false;
+  lv_obj_add_flag(blank_overlay, LV_OBJ_FLAG_HIDDEN);
+  set_status("ALL DISPLAYS ON", lv_palette_main(LV_PALETTE_GREEN));
+}
+
 void refresh_dashboard() {
   String response;
   if (!luna_request("GET", "/api/esp32/status", "", response)) {
-    set_status(WiFi.status() == WL_CONNECTED ? "LUNA OFFLINE" : "WIFI OFFLINE", lv_palette_main(LV_PALETTE_RED));
+    if (!blanked_mode) {
+      set_status(WiFi.status() == WL_CONNECTED ? "LUNA OFFLINE" : "WIFI OFFLINE", lv_palette_main(LV_PALETTE_RED));
+    }
     return;
   }
 
   JsonDocument document;
   DeserializationError error = deserializeJson(document, response);
   if (error) {
-    set_status("BAD STATUS DATA", lv_palette_main(LV_PALETTE_RED));
+    if (!blanked_mode) {
+      set_status("BAD STATUS DATA", lv_palette_main(LV_PALETTE_RED));
+    }
     return;
   }
 
@@ -123,7 +159,9 @@ void refresh_dashboard() {
   update_mute_button();
   big_brother_mode = document["big_brother_mode"].as<bool>();
   update_big_brother_button();
-  set_status("LUNA ONLINE", lv_palette_main(LV_PALETTE_GREEN));
+  if (!blanked_mode) {
+    set_status("LUNA ONLINE", lv_palette_main(LV_PALETTE_GREEN));
+  }
 
   JsonArray history = document["gpu_history"].as<JsonArray>();
   lv_chart_set_all_value(gpu_chart, gpu_series, LV_CHART_POINT_NONE);
@@ -163,6 +201,20 @@ void big_brother_button_event(lv_event_t *event) {
   big_brother_mode = target_mode;
   update_big_brother_button();
   set_status(big_brother_mode ? "BIG BROTHER ENABLED" : "BIG BROTHER DISABLED", lv_palette_main(LV_PALETTE_GREEN));
+}
+
+void blank_button_event(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+  enter_blank_mode();
+}
+
+void blank_overlay_event(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+  exit_blank_mode();
 }
 
 void make_dashboard() {
@@ -216,9 +268,30 @@ void make_dashboard() {
   lv_obj_center(big_brother_button_label);
   update_big_brother_button();
 
+  lv_obj_t *blank_button = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(blank_button, 125, 55);
+  lv_obj_align(blank_button, LV_ALIGN_TOP_RIGHT, -20, 238);
+  lv_obj_set_style_bg_color(blank_button, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
+  lv_obj_add_event_cb(blank_button, blank_button_event, LV_EVENT_ALL, NULL);
+  blank_button_label = lv_label_create(blank_button);
+  lv_label_set_text(blank_button_label, "BLANK ALL");
+  lv_obj_center(blank_button_label);
+
   status_label = lv_label_create(lv_scr_act());
   lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -12);
   set_status("STARTING", lv_palette_main(LV_PALETTE_YELLOW));
+
+  // Full-screen invisible overlay: shown only while blanked, catches a touch anywhere to wake everything.
+  blank_overlay = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(blank_overlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_obj_set_pos(blank_overlay, 0, 0);
+  lv_obj_set_style_bg_color(blank_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(blank_overlay, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(blank_overlay, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(blank_overlay, 0, LV_PART_MAIN);
+  lv_obj_clear_flag(blank_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(blank_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(blank_overlay, blank_overlay_event, LV_EVENT_ALL, NULL);
 }
 
 void setup() {

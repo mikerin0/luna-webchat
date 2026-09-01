@@ -431,8 +431,32 @@ def get_current_face_name() -> str:
         return str(_current_face_name)
 
 
+_backlight_on = True
+
+
+def set_backlight(on: bool) -> bool:
+    """Turn the LCD backlight on or off. Safe to call from any thread."""
+    global _backlight_on
+    device = _get_device()
+    if device is None:
+        return False
+    try:
+        with _lcd_lock:
+            device.backlight(bool(on))
+            _backlight_on = bool(on)
+        return True
+    except Exception as exc:
+        print(f"[LCD] backlight control failed: {exc}")
+        return False
+
+
+def get_backlight() -> bool:
+    return bool(_backlight_on)
+
+
 def show_image(path: str, duration_s: float = 0.0):
     """Display an image file full-screen, then optionally restore the prior face."""
+
 
     def _show_image():
         from PIL import Image

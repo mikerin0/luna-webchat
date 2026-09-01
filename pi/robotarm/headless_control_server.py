@@ -32,6 +32,7 @@ def _status() -> dict[str, Any]:
         "face": lcd.get_current_face_name(),
         "emotion": lcd.get_emotion(),
         "arm_power": brain.get_servo_power_status(timeout_s=1.5),
+        "lcd_backlight": lcd.get_backlight(),
     }
 
 
@@ -88,6 +89,14 @@ class _Handler(BaseHTTPRequestHandler):
             )
         elif action == "image":
             lcd.show_image(str(payload.get("path", "")), float(payload.get("duration", 0.0)))
+        elif action == "lcd_off":
+            if not lcd.set_backlight(False):
+                self._send(502, {"ok": False, "error": "lcd unavailable"})
+                return
+        elif action == "lcd_on":
+            if not lcd.set_backlight(True):
+                self._send(502, {"ok": False, "error": "lcd unavailable"})
+                return
         elif action == "arm_power_on":
             if not brain.power_on_and_rest():
                 self._send(502, {"ok": False, "error": "relay unreachable or rest pose failed"})
