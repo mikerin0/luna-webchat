@@ -208,7 +208,7 @@ VOICE_MAX_UTTERANCE_S = 12.0
 # RMS energy threshold (0–32767).  Chunks below this level are treated as
 # silence and never sent to Whisper.  Raise if background noise causes false
 # triggers; lower if you have a very quiet voice.
-VOICE_ENERGY_THRESHOLD = 550.0
+VOICE_ENERGY_THRESHOLD = 150.0
 # Seconds of additional mic suppression after TTS finishes playing.
 # Prevents the room echo / BT reverb tail from being heard as a new utterance.
 VOICE_POST_SPEECH_MUTE_S = 1.5
@@ -356,3 +356,19 @@ SMART_TAKE_GRIP_SWITCH_CONFIRM_READS = 2
 SMART_TAKE_GRIP_SWITCH_CONFIRM_INTERVAL_MS = 8
 SMART_TAKE_GRIP_TRIGGER_EXTRA_CLOSE_US = 28
 SMART_TAKE_GRIP_TRIGGER_EXTRA_CLOSE_TIME_MS = 140
+
+# --- Social behavior + object handoff safety limits ---
+# Abort/retreat if ultrasonic reads closer than this during non-handoff motion.
+# TODO: calibrate against the arm's real mounting height and typical obstacles.
+BEHAVIOR_OBSTACLE_STOP_CM = 3.0
+# Distance threshold to treat an object as being offered during receive_object.
+# TODO: calibrate against actual handoff zone geometry.
+BEHAVIOR_HANDOFF_NEAR_CM = 12.0
+# Ultrasonic delta (cm) required to count as a grasp/release confirmation signal.
+BEHAVIOR_HANDOFF_DELTA_CM = 1.5
+# Clamp bounds for gesture() energy scaling (0..this range maps small..large motion).
+BEHAVIOR_GESTURE_MIN_ENERGY = 0.15
+BEHAVIOR_GESTURE_MAX_ENERGY = 1.2
+# Use OFFER_NEAR (vs OFFER_FAR) when returning a held object to the user.
+BEHAVIOR_RETURN_USE_NEAR = True
+

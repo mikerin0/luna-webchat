@@ -1,6 +1,10 @@
 # poses.py
 # Stores absolute poses and direct servo commands
 
+# Neutral/home servo positions, reused by the behavior layer (brain.py) as the
+# baseline that gesture deltas are applied against.
+NEUTRAL_POSE = {1: 1500, 2: 1500, 3: 2500, 4: 2209, 5: 500, 6: 1500}
+
 POSES = {
     # Sequential, one-servo-at-a-time command lists:
     # (servo_id, absolute_position, time_ms)
@@ -141,7 +145,34 @@ POSES = {
         (1, 1500, 500),
         (1, 2200, 500),
         (1, 1500, 500),   
-    ]
+    ],
+
+    # --- Social behavior / object handoff safe poses ---------------------
+    # Neutral, arm tucked in — safe default state between behaviors.
+    "idle_safe": [
+        {"servos": dict(NEUTRAL_POSE), "time_ms": 1200},
+    ],
+    # Gripper offered close to the user for a handoff. Servo1 left at open
+    # position; behavior layer explicitly opens the claw before this pose.
+    # TODO: calibrate distance/angle for the actual mounting position.
+    "offer_near": [
+        {"servos": {1: 1500, 3: 1827, 4: 1568, 5: 1878, 6: 1500}, "time_ms": 1200},
+    ],
+    # Slightly further extended offer, e.g. for a person standing back a bit.
+    # TODO: calibrate against real reach envelope; currently an extrapolation
+    # of offer_near rather than a measured position.
+    "offer_far": [
+        {"servos": {1: 1500, 3: 1750, 4: 1480, 5: 1970, 6: 1500}, "time_ms": 1300},
+    ],
+    # Object held centrally and lifted clear of the handoff zone.
+    "hold_center": [
+        {"servos": {2: 1500, 3: 2021, 4: 2170, 5: 1121, 6: 1500}, "time_ms": 1200},
+    ],
+    # Pull back to a safe clearance pose before settling to idle.
+    "retract_safe": [
+        {"servos": {3: 2100, 4: 2200, 5: 1050, 6: 1500}, "time_ms": 900},
+        {"pose": "idle_safe"},
+    ],
 }
 
 def get_pose(name):

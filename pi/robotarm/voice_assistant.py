@@ -80,6 +80,10 @@ _SYSTEM_PROMPT = str(getattr(
 # RMS threshold below which a chunk is considered silence (0-32767 scale).
 # Raise VOICE_ENERGY_THRESHOLD in config.py if background noise triggers false positives.
 _ENERGY_THRESHOLD = float(getattr(config, "VOICE_ENERGY_THRESHOLD", 400.0))
+# Mic-check diagnostic: "Luna, repeat this" plays the exact recorded clip back
+# over the speaker instead of sending it to GPT, so overmodulation/clipping and
+# mic gain can be judged by ear.
+_REPEAT_COMMAND_RE = re.compile(r"\b(repeat (this|that)|play (that|this) back|mic check)\b", re.IGNORECASE)
 # AI tools (poses and faces) that GPT can call via function calling.
 _AI_TOOLS_ENABLED = bool(getattr(config, "VOICE_AI_TOOLS_ENABLED", False))
 _AI_TOOLS_ENABLED_LOCK = threading.Lock()
@@ -207,6 +211,24 @@ def _rms(wav_bytes: bytes) -> float:
     samples = struct.unpack_from(f"<{n}h", pcm)
     mean_sq = sum(s * s for s in samples) / n
     return mean_sq ** 0.5
+
+
+def _normalize_pcm_peak(pcm: bytes, target_peak: int = 28000) -> bytes:
+    """Scale s16le PCM so its loudest sample hits target_peak, preserving the
+    waveform's shape (and any real clipping/distortion) so a mic-check
+    playback is loudness-comparable to TTS without hiding overmodulation."""
+    n = len(pcm) // 2
+    if n == 0:
+        return pcm
+    samples = struct.unpack_from(f"<{n}h", pcm)
+    peak = max((abs(s) for s in samples), default=0)
+    if peak == 0:
+        return pcm
+    gain = min(80.0, target_peak / peak)
+    if gain <= 1.0:
+        return pcm
+    scaled = [max(-32768, min(32767, int(round(s * gain)))) for s in samples]
+    return struct.pack(f"<{n}h", *scaled)
 
 
 _post_speech_until: float = 0.0  # suppress listening until this timestamp
@@ -777,6 +799,17 @@ def _voice_loop():
         transcript = _transcribe(wav)
         if transcript:
             print(f"[Voice] Heard (rms={rms:.0f}): {transcript}")
+
+            if _REPEAT_COMMAND_RE.search(transcript):
+                print("[Voice] Mic-check: replaying recorded audio back over the speaker")
+                try:
+                    import brain
+                    normalized = _normalize_pcm_peak(wav[44:])
+                    brain.play_raw_audio(normalized, _MIC_RATE)
+                except Exception as exc:
+                    print(f"[Voice] Repeat playback error: {exc}")
+                continue
+
             print(f"[Voice] → GPT: {transcript}")
             reply = _call_luna_chat(transcript)
             if reply is None:

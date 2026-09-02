@@ -33,6 +33,8 @@ def _status() -> dict[str, Any]:
         "emotion": lcd.get_emotion(),
         "arm_power": brain.get_servo_power_status(timeout_s=1.5),
         "lcd_backlight": lcd.get_backlight(),
+        "lcd_blanked": lcd.is_blanked(),
+        "behavior_state": brain.get_behavior_state(),
     }
 
 
@@ -61,16 +63,30 @@ class _Handler(BaseHTTPRequestHandler):
         if not _authorized(self):
             self._send(401, {"ok": False, "error": "unauthorized"})
             return
-        if self.path != "/control":
-            self._send(404, {"ok": False, "error": "not found"})
-            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw or b"{}")
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"ok": False, "error": "invalid JSON"})
             return
+        if not isinstance(payload, dict):
+            payload = {}
 
+        if self.path == "/control":
+            self._handle_control(payload)
+        elif self.path == "/behavior/run":
+            self._handle_behavior_run(payload)
+        elif self.path == "/gesture":
+            self._handle_gesture(payload)
+        elif self.path == "/behavior/receive_object":
+            self._handle_receive_object(payload)
+        elif self.path == "/behavior/return_object":
+            self._handle_return_object(payload)
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def _handle_control(self, payload: dict[str, Any]) -> None:
         action = str(payload.get("action", "")).strip().lower()
         if action == "mute":
             voice_assistant.set_muted(True)
@@ -90,11 +106,13 @@ class _Handler(BaseHTTPRequestHandler):
         elif action == "image":
             lcd.show_image(str(payload.get("path", "")), float(payload.get("duration", 0.0)))
         elif action == "lcd_off":
-            if not lcd.set_backlight(False):
+            lcd.set_backlight(False)
+            if not lcd.set_blanked(True):
                 self._send(502, {"ok": False, "error": "lcd unavailable"})
                 return
         elif action == "lcd_on":
-            if not lcd.set_backlight(True):
+            lcd.set_backlight(True)
+            if not lcd.set_blanked(False):
                 self._send(502, {"ok": False, "error": "lcd unavailable"})
                 return
         elif action == "arm_power_on":
@@ -116,6 +134,48 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "unsupported action"})
             return
         self._send(200, _status())
+
+    def _behavior_status_code(self, result: dict[str, Any]) -> int:
+        if result.get("error") == "busy":
+            return 409
+        return 200
+
+    def _handle_behavior_run(self, payload: dict[str, Any]) -> None:
+        name = str(payload.get("name", "")).strip()
+        params = payload.get("params")
+        params = params if isinstance(params, dict) else {}
+        result = brain.run_behavior(name, **params)
+        self._send(self._behavior_status_code(result), result)
+
+    def _handle_gesture(self, payload: dict[str, Any]) -> None:
+        intent = str(payload.get("intent", "")).strip()
+        try:
+            energy = float(payload.get("energy", 0.4))
+            duration = float(payload.get("duration", 1.5))
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "state": brain.get_behavior_state(), "details": {}, "error": "invalid energy/duration"})
+            return
+        result = brain.gesture(intent, energy=energy, duration=duration)
+        self._send(self._behavior_status_code(result), result)
+
+    def _handle_receive_object(self, payload: dict[str, Any]) -> None:
+        try:
+            timeout_s = float(payload.get("timeout_s", 8.0))
+            retries = int(payload.get("retries", 1))
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "state": brain.get_behavior_state(), "details": {}, "error": "invalid timeout_s/retries"})
+            return
+        result = brain.receive_object(timeout_s=timeout_s, retries=retries)
+        self._send(self._behavior_status_code(result), result)
+
+    def _handle_return_object(self, payload: dict[str, Any]) -> None:
+        try:
+            timeout_s = float(payload.get("timeout_s", 8.0))
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "state": brain.get_behavior_state(), "details": {}, "error": "invalid timeout_s"})
+            return
+        result = brain.return_object(timeout_s=timeout_s)
+        self._send(self._behavior_status_code(result), result)
 
     def log_message(self, *_args: Any) -> None:
         return

@@ -381,7 +381,8 @@ def _get_device():
         from luma.core.interface.serial import spi
         from luma.lcd.device import st7789
         serial = spi(port=0, device=0, gpio_DC=25, gpio_RST=27, gpio_LIGHT=18)
-        _lcd_device = st7789(serial, width=320, height=240, rotate=0)
+        # Measured active-low: GPIO18 reads LOW while backlight is lit on this panel.
+        _lcd_device = st7789(serial, width=320, height=240, rotate=0, active_low=True)
         _lcd_available = True
         print("[LCD] ST7789 device initialised (320x240)")
         return _lcd_device
@@ -452,6 +453,36 @@ def set_backlight(on: bool) -> bool:
 
 def get_backlight() -> bool:
     return bool(_backlight_on)
+
+
+_blanked = False
+
+
+def set_blanked(on: bool) -> bool:
+    """Force a solid black frame and pause animation, since backlight GPIO may not
+    actually gate this panel's LED. This guarantees a visible blank regardless of wiring."""
+    global _blanked
+    device = _get_device()
+    if device is None:
+        return False
+    if on:
+        stop_animated_face_mode()
+        with _lcd_lock:
+            try:
+                from PIL import Image
+                device.display(Image.new("RGB", (device.width, device.height), (0, 0, 0)))
+                _blanked = True
+            except Exception as exc:
+                print(f"[LCD] blank render failed: {exc}")
+                return False
+    else:
+        _blanked = False
+        start_animated_face_mode()
+    return True
+
+
+def is_blanked() -> bool:
+    return bool(_blanked)
 
 
 def show_image(path: str, duration_s: float = 0.0):

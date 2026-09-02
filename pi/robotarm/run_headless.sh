@@ -9,4 +9,6 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Missing Pi Python environment: $PYTHON_BIN" >&2
   exit 1
 fi
+# Unbuffered stdout so print()-based logs actually reach journalctl in real time.
+export PYTHONUNBUFFERED=1
 exec "$PYTHON_BIN" headless_main.py

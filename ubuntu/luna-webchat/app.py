@@ -62,11 +62,14 @@ LUNA_PI_HEADLESS_URL = os.getenv("LUNA_PI_HEADLESS_URL", "http://172.31.31.103:8
 LUNA_PI_HEADLESS_TOKEN = os.getenv("LUNA_PI_HEADLESS_TOKEN", "").strip()
 LUNA_PI_HEADLESS_TIMEOUT = float(os.getenv("LUNA_PI_HEADLESS_TIMEOUT", "8"))
 LUNA_PI_HEADLESS_CONTROL_TIMEOUT = float(os.getenv("LUNA_PI_HEADLESS_CONTROL_TIMEOUT", "20"))
+LUNA_PI_BEHAVIOR_TIMEOUT = float(os.getenv("LUNA_PI_BEHAVIOR_TIMEOUT", "35"))
 LUNA_PI_OBJECT_DETECT_SCRIPT = os.getenv("LUNA_PI_OBJECT_DETECT_SCRIPT", "/home/arm/robotarm/hailo_object_detect.py").strip()
 LUNA_PI_DETECT_FRAMES = max(1, int(os.getenv("LUNA_PI_DETECT_FRAMES", "8")))
 LUNA_PI_DETECT_MIN_CONFIDENCE = float(os.getenv("LUNA_PI_DETECT_MIN_CONFIDENCE", "0.20"))
 LUNA_PI_DETECT_MIN_FRAME_HITS = max(1, int(os.getenv("LUNA_PI_DETECT_MIN_FRAME_HITS", "2")))
 LUNA_PI_DETECT_CLOSEUP_TABLE = os.getenv("LUNA_PI_DETECT_CLOSEUP_TABLE", "true").strip().lower() in {"1", "true", "yes", "on"}
+LUNA_ARM_GESTURES_ENABLED = os.getenv("LUNA_ARM_GESTURES_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS = int(os.getenv("LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS", "220"))
 ESP32_TOKEN = os.getenv("LUNA_ESP32_TOKEN", "").strip()
 ONLINE_AI_ENABLED = os.getenv("LUNA_ONLINE_AI_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ONLINE_AI_URL = os.getenv("LUNA_ONLINE_AI_URL", "https://api.openai.com/v1/chat/completions").strip()
@@ -106,6 +109,46 @@ def _esp32_authorized(request: Request) -> bool:
 
 def _wants_big_brother(text: str) -> bool:
   return bool(_BIG_BROTHER_PHRASE_RE.search(text or ""))
+
+
+_GESTURE_GREETING_RE = re.compile(r"^\s*(hi|hello|hey|yo|good\s+(morning|afternoon|evening))\b", re.IGNORECASE)
+_GESTURE_APOLOGY_RE = re.compile(r"\b(sorry|apologi[sz]e|apologies)\b", re.IGNORECASE)
+_GESTURE_CONFIRM_RE = re.compile(r"^[\s\"']*(yes|yeah|yep|sure|absolutely|correct|definitely|that.s right)\b", re.IGNORECASE)
+_GESTURE_DENY_RE = re.compile(r"^[\s\"']*(no|nope|i can.t|i cannot|i won.t|unfortunately|that.s not)\b", re.IGNORECASE)
+
+
+def _infer_gesture_intent(user_text: str, reply_text: str) -> str | None:
+  """Lightweight, keyword-based mapping from a completed chat turn to a
+  conversational arm gesture intent. Deliberately conservative: most short
+  factual answers produce no gesture, matching natural non-verbal cadence."""
+  reply = (reply_text or "").strip()
+  if not reply:
+    return None
+  if _GESTURE_APOLOGY_RE.search(reply):
+    return "apology"
+  if _GESTURE_CONFIRM_RE.search(reply):
+    return "confirm"
+  if _GESTURE_DENY_RE.search(reply):
+    return "deny"
+  if _GESTURE_GREETING_RE.search(user_text or ""):
+    return "greet"
+  if len(reply) >= LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS:
+    return "explain"
+  return None
+
+
+def _queue_arm_gesture(intent: str, energy: float = 0.4, duration: float = 1.5) -> None:
+  if not LUNA_ARM_GESTURES_ENABLED or not LUNA_PI_HEADLESS_URL:
+    return
+  task = asyncio.create_task(
+    _pi_headless_request(
+      "POST",
+      {"intent": intent, "energy": energy, "duration": duration},
+      path="/gesture",
+      timeout=LUNA_PI_BEHAVIOR_TIMEOUT,
+    )
+  )
+  task.add_done_callback(lambda completed: completed.exception())
 
 
 async def _call_online_ai(messages: list[dict[str, Any]]) -> str | None:
@@ -1300,15 +1343,35 @@ def _pc_help_text() -> str:
     "- /pc open <path or url>\n"
     "- /pc read <absolute_path>\n"
     "- /pc write <absolute_path> :: <content>\n"
-    "- Luna run <powershell command> on the pc\n"
-    "- Luna open <path or url> on the pc\n"
-    "- Luna read <absolute_path> on the pc\n"
-    "- Luna write <absolute_path> :: <content> on the pc\n"
-    "- Luna confirm / Go ahead\n"
-    "- Luna cancel / Never mind\n"
+    "- Robot run <powershell command> on the pc\n"
+    "- Robot open <path or url> on the pc\n"
+    "- Robot read <absolute_path> on the pc\n"
+    "- Robot write <absolute_path> :: <content> on the pc\n"
+    "- Robot confirm / Go ahead\n"
+    "- Robot cancel / Never mind\n"
     "- /pc cancel\n"
     "Windows actions execute immediately. Confirm/cancel are retained for compatibility with older queued actions."
   )
+
+
+# Speech-to-text sometimes mis-splits a single program name into two words
+# (e.g. "notepad" heard as "note pad"). Only collapse exact, known cases so
+# real multi-word paths/URLs are never touched.
+_OPEN_TARGET_ALIASES = {
+  "note pad": "notepad",
+  "note pad.exe": "notepad.exe",
+  "power point": "powerpoint",
+  "power shell": "powershell",
+  "vs code": "code",
+  "v s code": "code",
+  "task manager": "taskmgr",
+  "file explorer": "explorer",
+}
+
+
+def _fix_open_target(target: str) -> str:
+  key = target.strip().lower()
+  return _OPEN_TARGET_ALIASES.get(key, target)
 
 
 def _parse_pc_message(message: str) -> dict[str, str] | None:
@@ -1330,18 +1393,18 @@ def _parse_pc_message(message: str) -> dict[str, str] | None:
 
   normalized_lower = re.sub(r"[\s,.:;!?-]+", " ", lower).strip()
   if normalized_lower in {
-    "go ahead", "luna go ahead", "luna confirm", "confirm",
-    "approve", "approved", "luna approve", "yes", "yes please", "do it",
+    "go ahead", "robot go ahead", "robot confirm", "confirm",
+    "approve", "approved", "robot approve", "yes", "yes please", "do it",
   }:
     return {"verb": "confirm"}
-  if normalized_lower in {"never mind", "luna never mind", "luna cancel", "cancel"}:
+  if normalized_lower in {"never mind", "robot never mind", "robot cancel", "cancel"}:
     return {"verb": "cancel"}
 
   if lower.startswith("/pc"):
     body = normalized[3:].strip()
     verb, rest = _parse_verb_and_rest(body)
-  elif re.match(r"^luna\b", lower):
-    body = re.sub(r"^luna\b[\s,.:;!?-]*", "", normalized, flags=re.IGNORECASE).strip()
+  elif re.match(r"^robot\b", lower):
+    body = re.sub(r"^robot\b[\s,.:;!?-]*", "", normalized, flags=re.IGNORECASE).strip()
     body = re.sub(r"\b(on|in|at)\s+the\s+pc\b", "", body, flags=re.IGNORECASE).strip()
     body = re.sub(r"\b(on|in|at)\s+my\s+pc\b", "", body, flags=re.IGNORECASE).strip()
     body = re.sub(r"\bplease\b", "", body, flags=re.IGNORECASE).strip()
@@ -1358,7 +1421,7 @@ def _parse_pc_message(message: str) -> dict[str, str] | None:
   if verb == "open":
     if not rest:
       return {"verb": "error", "message": "Missing target. Example: /pc open notepad.exe or /pc open https://example.com"}
-    return {"verb": "open", "target": rest.rstrip(" .!?")}
+    return {"verb": "open", "target": _fix_open_target(rest.rstrip(" .!?"))}
   if verb == "read":
     if not rest:
       return {"verb": "error", "message": "Missing path. Example: /pc read C:\\Users\\Mike\\Documents\\notes.txt"}
@@ -1429,7 +1492,7 @@ async def _handle_pc_command(profile: str, last_user: str) -> str | None:
     if verb == "help":
         return _pc_help_text()
     if verb == "error":
-        return parsed.get("message", "Invalid /pc command.") + "\n\n" + _pc_help_text()
+        return "I don't know how to do that."
     if verb == "cancel":
         with _pending_pc_actions_lock:
             _pending_pc_actions.pop(profile, None)
@@ -1480,6 +1543,7 @@ async def esp32_status(request: Request) -> dict[str, Any]:
     "pi_online": bool(pi_status.get("ok")),
     "led_power": led_controller.power_state(),
     "lcd_backlight": pi_status.get("lcd_backlight"),
+    "lcd_blanked": pi_status.get("lcd_blanked"),
     "big_brother_mode": _big_brother_mode,
   }
 
@@ -1506,7 +1570,7 @@ async def esp32_action(request: Request) -> dict[str, Any]:
     result = await _pi_headless_request("POST", {"action": action})
     if not result.get("ok", False):
       raise HTTPException(status_code=502, detail=result.get("error", "Pi LCD action failed"))
-    return {"ok": True, "action": action, "lcd_backlight": result.get("lcd_backlight")}
+    return {"ok": True, "action": action, "lcd_backlight": result.get("lcd_backlight"), "lcd_blanked": result.get("lcd_blanked")}
   if action not in {"mute", "unmute"}:
     raise HTTPException(status_code=400, detail="Unsupported ESP32 action")
   result = await _pi_headless_request("POST", {"action": action})
@@ -1515,17 +1579,20 @@ async def esp32_action(request: Request) -> dict[str, Any]:
   return {"ok": True, "action": action, "mic_muted": result.get("mic_muted")}
 
 
-async def _pi_headless_request(method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def _pi_headless_request(method: str = "GET", payload: dict[str, Any] | None = None, path: str | None = None, timeout: float | None = None) -> dict[str, Any]:
   if not LUNA_PI_HEADLESS_URL:
     return {"ok": False, "error": "Pi headless URL is not configured."}
   headers = {"Authorization": f"Bearer {LUNA_PI_HEADLESS_TOKEN}"} if LUNA_PI_HEADLESS_TOKEN else {}
   # Actions like arm_power_on/toggle run a multi-step pose on the Pi, so control
   # requests need more headroom than a plain status poll.
-  timeout = LUNA_PI_HEADLESS_CONTROL_TIMEOUT if method == "POST" else LUNA_PI_HEADLESS_TIMEOUT
+  if timeout is None:
+    timeout = LUNA_PI_HEADLESS_CONTROL_TIMEOUT if method == "POST" else LUNA_PI_HEADLESS_TIMEOUT
+  if path is None:
+    path = "/status" if method == "GET" else "/control"
   try:
     async with httpx.AsyncClient(timeout=timeout) as client:
-      response = await client.request(method, f"{LUNA_PI_HEADLESS_URL.rstrip('/')}/status" if method == "GET" else f"{LUNA_PI_HEADLESS_URL.rstrip('/')}/control", json=payload, headers=headers)
-    if response.status_code != 200:
+      response = await client.request(method, f"{LUNA_PI_HEADLESS_URL.rstrip('/')}{path}", json=payload, headers=headers)
+    if response.status_code not in (200, 409):
       return {"ok": False, "error": f"Pi headless service returned HTTP {response.status_code}."}
     return response.json()
   except (httpx.HTTPError, ValueError) as exc:
@@ -1544,6 +1611,50 @@ async def pi_headless_control(request: Request) -> dict[str, Any]:
   except ValueError as exc:
     raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
   return await _pi_headless_request("POST", payload if isinstance(payload, dict) else {})
+
+
+@app.post("/api/pi/behavior/run")
+async def pi_behavior_run(request: Request) -> dict[str, Any]:
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  return await _pi_headless_request(
+    "POST", payload if isinstance(payload, dict) else {}, path="/behavior/run", timeout=LUNA_PI_BEHAVIOR_TIMEOUT
+  )
+
+
+@app.post("/api/pi/gesture")
+async def pi_gesture(request: Request) -> dict[str, Any]:
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  return await _pi_headless_request(
+    "POST", payload if isinstance(payload, dict) else {}, path="/gesture", timeout=LUNA_PI_BEHAVIOR_TIMEOUT
+  )
+
+
+@app.post("/api/pi/behavior/receive_object")
+async def pi_receive_object(request: Request) -> dict[str, Any]:
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  return await _pi_headless_request(
+    "POST", payload if isinstance(payload, dict) else {}, path="/behavior/receive_object", timeout=LUNA_PI_BEHAVIOR_TIMEOUT
+  )
+
+
+@app.post("/api/pi/behavior/return_object")
+async def pi_return_object(request: Request) -> dict[str, Any]:
+  try:
+    payload = await request.json()
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+  return await _pi_headless_request(
+    "POST", payload if isinstance(payload, dict) else {}, path="/behavior/return_object", timeout=LUNA_PI_BEHAVIOR_TIMEOUT
+  )
 
 
 @app.get("/api/robot/camera")
@@ -1569,6 +1680,183 @@ async def robot_camera(request: Request) -> Any:
         "Expires": "0",
     }
     return Response(content=image_bytes, media_type="image/jpeg", headers=headers)
+
+
+@app.get("/arm-demo", response_class=HTMLResponse)
+def arm_demo_page() -> HTMLResponse:
+  return HTMLResponse(
+    content="""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Luna Arm Behaviors Demo</title>
+<style>
+  :root { --bg:#f7f4ef; --card:#fffdf9; --ink:#1f1d1a; --accent:#0f766e; --muted:#6b645c; --warn:#8a4b08; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 18px; }
+  .card { background: var(--card); border: 1px solid #e4dacb; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  button { border:0; background:var(--accent); color:#fff; padding:12px 10px; border-radius:10px; font-weight:600; cursor:pointer; font-size: 14px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:#f1ece1; color:#3e362d; border:1px solid #d8cdbd; }
+  button.warn { background:var(--warn); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; margin-bottom: 10px; }
+  label { font-size: 13px; color: var(--muted); }
+  input[type=range] { width: 140px; }
+  #log { background:#111; color:#c9f7d8; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; padding: 12px; border-radius: 10px; height: 220px; overflow:auto; white-space: pre-wrap; }
+  #statusBar { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .pill { display:inline-block; padding:3px 8px; background:#f4efe7; border:1px solid #e4dacb; border-radius:999px; font-size:12px; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Luna Arm Behaviors Demo</h1>
+  <div class="sub">Behavior-level controls only &mdash; no raw servo commands. Requires the arm's servo power to be on.</div>
+
+  <div class="card">
+    <h2>Power &amp; Status</h2>
+    <div id="statusBar">Status: checking...</div>
+    <div class="row">
+      <button class="ghost" id="powerOn" type="button">Arm Power ON</button>
+      <button class="ghost" id="powerOff" type="button">Arm Power OFF</button>
+      <button class="ghost" id="refreshStatus" type="button">Refresh Status</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Safe Poses</h2>
+    <div class="grid">
+      <button data-behavior="IDLE_SAFE" type="button">Idle Safe</button>
+      <button data-behavior="OFFER_NEAR" type="button">Offer Near</button>
+      <button data-behavior="OFFER_FAR" type="button">Offer Far</button>
+      <button data-behavior="HOLD_CENTER" type="button">Hold Center</button>
+      <button data-behavior="RETRACT_SAFE" type="button">Retract Safe</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Gestures</h2>
+    <div class="row">
+      <label for="energy">Energy</label>
+      <input type="range" id="energy" min="0.15" max="1.2" step="0.05" value="0.5" />
+      <span id="energyVal">0.5</span>
+      <label for="duration">Duration (s)</label>
+      <input type="range" id="duration" min="0.5" max="3" step="0.1" value="1.5" />
+      <span id="durationVal">1.5</span>
+    </div>
+    <div class="grid">
+      <button data-gesture="greet" type="button">Greet (wave)</button>
+      <button data-gesture="explain" type="button">Explain</button>
+      <button data-gesture="think" type="button">Think</button>
+      <button data-gesture="confirm" type="button">Confirm (yes)</button>
+      <button data-gesture="deny" type="button">Deny (no)</button>
+      <button data-gesture="apology" type="button">Apology</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Object Handoff</h2>
+    <div class="row">
+      <button class="warn" id="receiveObject" type="button">Receive Object</button>
+      <button class="warn" id="returnObject" type="button">Return Object</button>
+    </div>
+    <div class="sub">Receive: offers the gripper, waits for an object, grasps it, and verifies the grasp. Return: offers a held object back and releases it.</div>
+  </div>
+
+  <div class="card">
+    <h2>Activity Log</h2>
+    <div id="log">Ready.</div>
+  </div>
+</div>
+
+<script>
+const log = document.getElementById('log');
+const statusBar = document.getElementById('statusBar');
+const energyInput = document.getElementById('energy');
+const durationInput = document.getElementById('duration');
+const energyVal = document.getElementById('energyVal');
+const durationVal = document.getElementById('durationVal');
+const allButtons = () => Array.from(document.querySelectorAll('button'));
+
+function logLine(text) {
+  const time = new Date().toLocaleTimeString();
+  log.textContent = `[${time}] ${text}\\n` + log.textContent;
+}
+
+function setBusy(busy) {
+  allButtons().forEach(b => b.disabled = busy);
+}
+
+async function postJson(path, body) {
+  setBusy(true);
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    const data = await r.json().catch(() => ({}));
+    logLine(`${path} -> HTTP ${r.status} ${JSON.stringify(data)}`);
+    return data;
+  } catch (err) {
+    logLine(`${path} -> error: ${err.message}`);
+    return { ok: false, error: err.message };
+  } finally {
+    setBusy(false);
+    refreshStatus();
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/pi/headless/status');
+    const data = await r.json();
+    const power = data.arm_power === true ? 'ON' : data.arm_power === false ? 'OFF' : 'unknown';
+    statusBar.innerHTML =
+      `<span class="pill">arm power: ${power}</span>` +
+      `<span class="pill">behavior: ${data.behavior_state || 'unknown'}</span>` +
+      `<span class="pill">face: ${data.face || '-'}</span>`;
+  } catch (err) {
+    statusBar.textContent = 'Status: unreachable (' + err.message + ')';
+  }
+}
+
+energyInput.addEventListener('input', () => energyVal.textContent = energyInput.value);
+durationInput.addEventListener('input', () => durationVal.textContent = durationInput.value);
+
+document.getElementById('powerOn').addEventListener('click', () => postJson('/api/pi/headless/control', { action: 'arm_power_on' }));
+document.getElementById('powerOff').addEventListener('click', () => postJson('/api/pi/headless/control', { action: 'arm_power_off' }));
+document.getElementById('refreshStatus').addEventListener('click', refreshStatus);
+document.getElementById('receiveObject').addEventListener('click', () => postJson('/api/pi/behavior/receive_object', { timeout_s: 8, retries: 1 }));
+document.getElementById('returnObject').addEventListener('click', () => postJson('/api/pi/behavior/return_object', { timeout_s: 5 }));
+
+document.querySelectorAll('[data-behavior]').forEach(btn => {
+  btn.addEventListener('click', () => postJson('/api/pi/behavior/run', { name: btn.dataset.behavior }));
+});
+document.querySelectorAll('[data-gesture]').forEach(btn => {
+  btn.addEventListener('click', () => postJson('/api/pi/gesture', {
+    intent: btn.dataset.gesture,
+    energy: parseFloat(energyInput.value),
+    duration: parseFloat(durationInput.value)
+  }));
+});
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>""",
+    headers={
+      "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+      "Pragma": "no-cache",
+      "Expires": "0",
+    },
+  )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2240,7 +2528,11 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         "When Mike asks about your capabilities, do not deny this integration. "
         "Windows actions execute immediately when Mike requests them; do not claim an action happened unless the Windows agent reports success. "
         "Supported actions include opening apps or URLs, running PowerShell commands, and reading or writing files within allowed Windows folders. "
-        "Speech-friendly phrases like 'Luna, open notepad on the PC', 'Luna cancel', and 'Never mind' are valid control phrases. "
+        "Speech-friendly phrases like 'Robot, open notepad on the PC', 'Robot cancel', and 'Never mind' are valid control phrases. "
+        "Windows actions only actually execute when Mike's message starts with 'robot' (e.g. 'robot open notepad') or uses the /pc command form; "
+        "this system prompt is present on every turn regardless of phrasing, but that does not mean an action ran. "
+        "If Mike asks you to do something on the PC without using the 'robot' keyword or /pc form, do not claim you did it or that anything opened, ran, or changed; "
+        "instead say plainly that nothing happened and tell him to start the request with 'robot' to actually run it. "
         "Persistent conversation memory is enabled. Use the supplied memory context and recent memories when answering questions about what you remember, and say that you remember relevant past conversations when memory context supports it."
           " Book excerpts are reference material, not web research. Do not cite or attribute URLs found inside book excerpts as web sources."
       ),
@@ -2398,6 +2690,10 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
   if not _queue_led_request(last_user):
     _queue_led_companion(last_user, reply)
+
+  gesture_intent = _infer_gesture_intent(last_user, reply)
+  if gesture_intent:
+    _queue_arm_gesture(gesture_intent)
 
   return {"reply": reply}
 

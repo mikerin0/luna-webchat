@@ -14,6 +14,7 @@ import tempfile
 
 import config
 import poses
+import gesture_map
 
 try:
     import serial
@@ -1129,6 +1130,297 @@ def close_claw(
         return True
 
 
+# ---------------------------------------------------------------------------
+# Social behavior + object handoff layer
+#
+# This sits above the raw servo/pose/gripper primitives above: AI callers
+# (Luna, voice assistant, etc.) should only ever call run_behavior/gesture/
+# receive_object/return_object rather than issuing raw servo commands, so
+# safety checks and state tracking stay centralised in one place.
+# ---------------------------------------------------------------------------
+
+_behavior_lock = threading.Lock()
+_behavior_state = "idle"
+_explain_gesture_toggle = False
+
+# Named safe/handoff poses that run_behavior() is allowed to move to directly.
+_BEHAVIOR_POSE_NAMES = {"IDLE_SAFE", "OFFER_NEAR", "OFFER_FAR", "HOLD_CENTER", "RETRACT_SAFE"}
+
+
+def _log_behavior(event: str, **fields) -> None:
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    print(f"[Behavior] {event}" + (f" {detail}" if detail else ""))
+
+
+def _set_behavior_state(state: str) -> None:
+    global _behavior_state
+    _behavior_state = str(state)
+    _log_behavior("state_change", state=_behavior_state)
+
+
+def get_behavior_state() -> str:
+    """Current high-level behavior state: idle, converse_gesture, receive_object,
+    holding_object, return_object, or recover."""
+    return _behavior_state
+
+
+def _safety_check_before_motion() -> str | None:
+    """Return an error string if a behavior should refuse to move, else None."""
+    if get_servo_power_status(timeout_s=1.5) is not True:
+        return "servo power is off"
+    obstacle_limit = float(getattr(config, "BEHAVIOR_OBSTACLE_STOP_CM", 3.0))
+    dist = read_ultrasonic_cm()
+    if dist is not None and dist < obstacle_limit:
+        return f"obstacle too close ({dist:.1f} cm)"
+    return None
+
+
+def run_behavior(name: str, **kwargs) -> dict:
+    """Run one of the named safe poses (IDLE_SAFE/OFFER_NEAR/OFFER_FAR/
+    HOLD_CENTER/RETRACT_SAFE). This is the only way AI callers should move the
+    arm to a fixed posture; raw per-servo commands are not exposed here."""
+    key = str(name or "").strip().upper()
+    if key not in _BEHAVIOR_POSE_NAMES:
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": f"unknown behavior '{name}'"}
+    if not _behavior_lock.acquire(blocking=False):
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": "busy"}
+    try:
+        _log_behavior("behavior_start", name=key)
+        reason = _safety_check_before_motion()
+        if reason:
+            _log_behavior("safety_stop", reason=reason)
+            return {"ok": False, "state": get_behavior_state(), "details": {}, "error": reason}
+        ok = bool(run_pose(key.lower()))
+        _set_behavior_state("idle" if key != "HOLD_CENTER" else "holding_object")
+        _log_behavior("behavior_end", name=key, ok=ok)
+        return {
+            "ok": ok,
+            "state": get_behavior_state(),
+            "details": {"pose": key.lower()},
+            "error": None if ok else "pose execution failed",
+        }
+    finally:
+        _behavior_lock.release()
+
+
+def gesture(intent: str, energy: float = 0.4, duration: float = 1.5) -> dict:
+    """Play a short conversational gesture clip mapped from an intent name,
+    scaling amplitude/speed by energy (clamped to safe bounds)."""
+    global _explain_gesture_toggle
+    key = str(intent or "").strip().lower()
+    mapped = gesture_map.INTENT_TO_GESTURE.get(key)
+    if mapped is None:
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": f"unknown intent '{intent}'"}
+
+    if isinstance(mapped, (list, tuple)):
+        clip_name = mapped[int(_explain_gesture_toggle) % len(mapped)]
+        _explain_gesture_toggle = not _explain_gesture_toggle
+    else:
+        clip_name = mapped
+    clip = gesture_map.GESTURE_CLIPS.get(clip_name)
+    if not clip:
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": f"gesture clip '{clip_name}' not found"}
+
+    if not _behavior_lock.acquire(blocking=False):
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": "busy"}
+    try:
+        _set_behavior_state("converse_gesture")
+        reason = _safety_check_before_motion()
+        if reason:
+            _log_behavior("safety_stop", reason=reason)
+            _set_behavior_state("idle")
+            return {"ok": False, "state": get_behavior_state(), "details": {}, "error": reason}
+
+        min_energy = float(getattr(config, "BEHAVIOR_GESTURE_MIN_ENERGY", 0.15))
+        max_energy = float(getattr(config, "BEHAVIOR_GESTURE_MAX_ENERGY", 1.2))
+        energy_clamped = max(min_energy, min(max_energy, float(energy)))
+        _log_behavior("behavior_start", name="gesture", intent=key, clip=clip_name, energy=energy_clamped, duration=duration)
+
+        for frame in clip:
+            face = frame.get("face")
+            if face:
+                try:
+                    import lcd
+                    lcd.show_face(str(face))
+                except Exception as exc:
+                    print(f"[Brain] gesture face step failed: {exc}")
+            base_time_ms = int(frame.get("time_ms", 300))
+            # Scale playback speed by requested duration relative to a 1.5s nominal clip pace.
+            time_ms = max(80, min(2000, int(base_time_ms * max(0.4, min(2.0, float(duration) / 1.5)))))
+            delta = frame.get("delta") or {}
+            if delta:
+                positions = {}
+                for sid, d in delta.items():
+                    sid = int(sid)
+                    base = poses.NEUTRAL_POSE.get(sid, 1500)
+                    scaled = base + int(round(float(d) * energy_clamped))
+                    positions[sid] = _clamp_servo_position(sid, scaled)
+                send_multi_servo_command(positions, time_ms)
+            time.sleep(time_ms / 1000.0)
+
+        # Settle back to neutral so consecutive gestures start from a known pose.
+        send_multi_servo_command(dict(poses.NEUTRAL_POSE), 500)
+        time.sleep(0.5)
+        _set_behavior_state("idle")
+        _log_behavior("behavior_end", name="gesture", intent=key, clip=clip_name)
+        return {
+            "ok": True,
+            "state": get_behavior_state(),
+            "details": {"clip": clip_name, "energy": energy_clamped},
+            "error": None,
+        }
+    finally:
+        _behavior_lock.release()
+
+
+def receive_object(timeout_s: float = 8.0, retries: int = 1) -> dict:
+    """Offer the gripper toward the user, wait for an object candidate, then
+    grasp it with a two-stage close and verify the grasp with a 2-of-3 signal
+    vote (gripper switch, ultrasonic delta, optional vision flag)."""
+    if not _behavior_lock.acquire(blocking=False):
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": "busy"}
+    try:
+        near_cm = float(getattr(config, "BEHAVIOR_HANDOFF_NEAR_CM", 12.0))
+        delta_cm = float(getattr(config, "BEHAVIOR_HANDOFF_DELTA_CM", 1.5))
+        details: dict = {}
+        attempts = max(1, int(retries) + 1)
+
+        for attempt in range(1, attempts + 1):
+            _set_behavior_state("receive_object")
+            reason = _safety_check_before_motion()
+            if reason:
+                _log_behavior("safety_stop", reason=reason)
+                _set_behavior_state("idle")
+                return {"ok": False, "state": get_behavior_state(), "details": details, "error": reason}
+
+            _log_behavior("behavior_start", name="receive_object", attempt=attempt)
+            open_claw(time_ms=400)
+            run_pose("offer_near")
+            time.sleep(0.3)
+
+            baseline_dist = read_ultrasonic_cm()
+            deadline = time.time() + max(1.0, float(timeout_s))
+            candidate_seen = False
+            while time.time() < deadline:
+                dist = read_ultrasonic_cm()
+                if dist is not None and dist <= near_cm:
+                    candidate_seen = True
+                    _log_behavior("sensor_check", sensor="ultrasonic", dist_cm=dist)
+                    break
+                try:
+                    import table_detect
+                    det = table_detect.get_detected_object()
+                    if det is not None and det.get("stable"):
+                        candidate_seen = True
+                        _log_behavior("sensor_check", sensor="vision", detail=str(det))
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+            if not candidate_seen:
+                _log_behavior("receive_object_timeout", attempt=attempt)
+                details = {"reason": "no object candidate detected"}
+                if attempt >= attempts:
+                    break
+                continue
+
+            # Two-stage close: gentle settle, then a firmer confirm close.
+            close_claw(step_us=18, step_time_ms=90)
+            time.sleep(0.15)
+            close_claw(step_us=30, step_time_ms=110)
+            switch_ok = did_last_close_stop_on_switch()
+
+            run_pose("hold_center")
+            time.sleep(0.2)
+
+            dist_after = read_ultrasonic_cm()
+            dist_signal = bool(
+                dist_after is not None and baseline_dist is not None and (baseline_dist - dist_after) > delta_cm
+            )
+            vision_signal = False
+            try:
+                import table_detect
+                det2 = table_detect.get_detected_object()
+                vision_signal = bool(det2 is not None and det2.get("stable"))
+            except Exception:
+                pass
+
+            votes = sum([bool(switch_ok), dist_signal, vision_signal])
+            details = {
+                "switch_confirmed": bool(switch_ok),
+                "ultrasonic_delta_signal": dist_signal,
+                "vision_signal": vision_signal,
+                "votes": votes,
+            }
+            _log_behavior("grasp_check", **details)
+
+            if switch_ok or votes >= 2:
+                _set_behavior_state("holding_object")
+                _log_behavior("behavior_end", name="receive_object", ok=True, attempt=attempt)
+                return {"ok": True, "state": get_behavior_state(), "details": details, "error": None}
+
+            _log_behavior("receive_object_grasp_failed", attempt=attempt)
+            open_claw(time_ms=400)
+            if attempt >= attempts:
+                break
+            time.sleep(0.3)
+
+        _set_behavior_state("recover")
+        run_pose("idle_safe")
+        _set_behavior_state("idle")
+        _log_behavior("behavior_end", name="receive_object", ok=False)
+        return {"ok": False, "state": get_behavior_state(), "details": details, "error": "grasp not confirmed"}
+    finally:
+        _behavior_lock.release()
+
+
+def return_object(timeout_s: float = 8.0) -> dict:
+    """Offer a held object back toward the user, open the gripper, and settle
+    back to a safe idle pose."""
+    if not _behavior_lock.acquire(blocking=False):
+        return {"ok": False, "state": get_behavior_state(), "details": {}, "error": "busy"}
+    try:
+        _set_behavior_state("return_object")
+        reason = _safety_check_before_motion()
+        if reason:
+            _log_behavior("safety_stop", reason=reason)
+            _set_behavior_state("idle")
+            return {"ok": False, "state": get_behavior_state(), "details": {}, "error": reason}
+
+        _log_behavior("behavior_start", name="return_object")
+        offer_pose = "offer_near" if bool(getattr(config, "BEHAVIOR_RETURN_USE_NEAR", True)) else "offer_far"
+        run_pose(offer_pose)
+        time.sleep(0.3)
+
+        delta_cm = float(getattr(config, "BEHAVIOR_HANDOFF_DELTA_CM", 1.5))
+        baseline_dist = read_ultrasonic_cm()
+        open_claw(time_ms=int(max(400, min(1500, float(timeout_s) * 60))))
+
+        deadline = time.time() + max(0.5, min(3.0, float(timeout_s)))
+        released = False
+        while time.time() < deadline:
+            dist = read_ultrasonic_cm()
+            if dist is not None and baseline_dist is not None and (dist - baseline_dist) > delta_cm:
+                released = True
+                _log_behavior("sensor_check", sensor="ultrasonic_release", dist_cm=dist)
+                break
+            time.sleep(0.1)
+
+        run_pose("retract_safe")
+        run_pose("idle_safe")
+        _set_behavior_state("idle")
+        _log_behavior("behavior_end", name="return_object", ok=True, released_confirmed=released)
+        return {
+            "ok": True,
+            "state": get_behavior_state(),
+            "details": {"release_confirmed": released, "offer_pose": offer_pose},
+            "error": None,
+        }
+    finally:
+        _behavior_lock.release()
+
+
 def _pick_tts_model_path():
     model_candidates = getattr(config, "TTS_MODEL_CANDIDATES", None)
     if not isinstance(model_candidates, (list, tuple)) or not model_candidates:
@@ -1508,6 +1800,28 @@ def say(text):
         return False
 
 
+def play_raw_audio(pcm_s16_mono: bytes, sample_rate: int) -> bool:
+    """Play back raw recorded mic audio through the speaker (e.g. for a
+    'repeat this' mic-check command), reusing the same speaking-state flag
+    as TTS so the voice loop doesn't re-trigger on its own playback."""
+    if not pcm_s16_mono:
+        return False
+
+    def _worker():
+        _tts_speaking.set()
+        try:
+            _play_pcm_s16_mono(pcm_s16_mono, int(sample_rate))
+        finally:
+            _tts_speaking.clear()
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+    except Exception as exc:
+        print(f"[Brain] play_raw_audio() failed: {exc}")
+        return False
+
+
 class RobotBrain:
     """Compatibility wrapper for older callers expecting an instance API."""
 
@@ -1549,6 +1863,21 @@ class RobotBrain:
 
     def stop_crestron_server(self):
         stop_crestron_server()
+
+    def run_behavior(self, name: str, **kwargs) -> dict:
+        return run_behavior(name, **kwargs)
+
+    def gesture(self, intent: str, energy: float = 0.4, duration: float = 1.5) -> dict:
+        return gesture(intent, energy=energy, duration=duration)
+
+    def receive_object(self, timeout_s: float = 8.0, retries: int = 1) -> dict:
+        return receive_object(timeout_s=timeout_s, retries=retries)
+
+    def return_object(self, timeout_s: float = 8.0) -> dict:
+        return return_object(timeout_s=timeout_s)
+
+    def get_behavior_state(self) -> str:
+        return get_behavior_state()
 
 
 # Initialize gripper switch once module is loaded so close_claw can actually stop
