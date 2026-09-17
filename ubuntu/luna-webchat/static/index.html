@@ -1,0 +1,564 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Luna Local Chat+</title>
+  <style>
+    :root { --bg:#f7f4ef; --card:#fffdf9; --ink:#1f1d1a; --accent:#0f766e; --muted:#6b645c; --warn:#8a4b08; }
+    body { margin:0; font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif; background: radial-gradient(circle at 10% 10%, #efe7da 0, var(--bg) 45%); color:var(--ink); }
+    .wrap { max-width:900px; margin:24px auto; padding:16px; }
+    .card { background:var(--card); border:1px solid #e7dece; border-radius:16px; box-shadow:0 12px 30px rgba(0,0,0,.06); overflow:hidden; }
+    .head { padding:16px 18px; border-bottom:1px solid #eee2d0; display:flex; justify-content:space-between; align-items:center; }
+    .head h1 { font-size:20px; margin:0; letter-spacing:.2px; }
+    .badge { font-size:12px; color:#fff; background:var(--accent); padding:4px 8px; border-radius:999px; }
+    #log { height:58vh; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+    .msg { max-width:82%; padding:10px 12px; border-radius:12px; line-height:1.35; white-space:pre-wrap; }
+    .u { align-self:flex-end; background:#e8f8f6; border:1px solid #bce9e3; }
+    .a { align-self:flex-start; background:#f3eee5; border:1px solid #e4dacb; }
+    .foot { display:grid; gap:10px; padding:14px; border-top:1px solid #eee2d0; }
+    .row { display:flex; gap:10px; }
+    input, select { flex:1; font-size:16px; padding:11px 12px; border-radius:10px; border:1px solid #d8cdbd; }
+    .small { font-size:14px; }
+    button { border:0; background:var(--accent); color:#fff; padding:11px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .ghost { background:#f1ece1; color:#3e362d; border:1px solid #d8cdbd; }
+    .pill { display:inline-block; padding:4px 8px; background:#f4efe7; border:1px solid #e4dacb; border-radius:999px; font-size:12px; margin:2px 6px 0 0; }
+    .warn { color:var(--warn); }
+    .note { color:var(--muted); font-size:13px; margin-top:8px; }
+    @media (max-width: 640px) { .row { flex-direction:column; } .msg { max-width:92%; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head"><h1>Luna Chat+</h1><span class="badge">local ollama</span></div>
+      <div id="log"></div>
+      <form class="foot" id="f">
+        <div class="row">
+          <input id="q" autocomplete="off" placeholder="Ask Luna anything..." />
+          <button class="ghost" id="mic" type="button">Start Mic</button>
+          <button id="send" type="submit">Send</button>
+        </div>
+        <div class="row">
+          <label class="small" for="profileSelect" style="display:flex;align-items:center;white-space:nowrap;">Memory profile</label>
+          <select class="small" id="profileSelect"></select>
+          <button class="ghost" id="newProfile" type="button">New Profile</button>
+        </div>
+        <div class="row">
+          <label class="small" for="modelSelect" style="display:flex;align-items:center;white-space:nowrap;">Model</label>
+          <select class="small" id="modelSelect"></select>
+        </div>
+        <div class="row">
+          <span class="small" id="piStatus">Pi headless: checking...</span>
+          <button class="ghost small" id="piMute" type="button">Mute Pi Mic</button>
+          <button class="ghost small" id="piPower" type="button">Arm Power</button>
+          <button class="ghost small" id="ledPower" type="button">LED: unknown</button>
+        </div>
+        <div class="row">
+          <input class="small" id="files" type="file" multiple />
+          <label class="small" style="display:flex;align-items:center;gap:6px;border:1px solid #d8cdbd;border-radius:10px;padding:8px 10px;background:#fff8ec;white-space:nowrap;">
+            <input id="webResearch" type="checkbox" />
+            Web research
+          </label>
+          <label class="small" style="display:flex;align-items:center;gap:6px;border:1px solid #d8cdbd;border-radius:10px;padding:8px 10px;background:#fff8ec;white-space:nowrap;">
+            <input id="bigBrother" type="checkbox" />
+            Ask Big Brother
+          </label>
+        </div>
+        <div class="row">
+          <input class="small" id="bookFile" type="file" accept=".txt,.md,.markdown,.epub,.pdf,.mobi,.azw,.azw3" />
+          <button class="ghost" id="ingestBook" type="button">Ingest Book</button>
+        </div>
+        <div id="attachments"></div>
+      </form>
+    </div>
+    <div class="note">Pick a memory profile to compartmentalize context and choose a model per chat session. You can use Start Mic for voice input on browsers that support speech recognition (Edge/Chrome). Identity is enforced server-side: assistant=Luna, user=Mike. Web research is opt-in and uses public web pages without paid API keys. Windows control is available via /pc run, /pc open, /pc read, and /pc write. Ask about CPU, disk, load, uptime, or temperature to get Linux server stats.</div>
+  </div>
+
+<script>
+const log = document.getElementById('log');
+const form = document.getElementById('f');
+const q = document.getElementById('q');
+const micBtn = document.getElementById('mic');
+const send = document.getElementById('send');
+const fileInput = document.getElementById('files');
+const bookFileInput = document.getElementById('bookFile');
+const ingestBookBtn = document.getElementById('ingestBook');
+const profileSelect = document.getElementById('profileSelect');
+const modelSelect = document.getElementById('modelSelect');
+const piStatus = document.getElementById('piStatus');
+const piMuteBtn = document.getElementById('piMute');
+const piPowerBtn = document.getElementById('piPower');
+const ledPowerBtn = document.getElementById('ledPower');
+const newProfileBtn = document.getElementById('newProfile');
+const webResearch = document.getElementById('webResearch');
+const bigBrother = document.getElementById('bigBrother');
+const attachmentsBox = document.getElementById('attachments');
+let recognition = null;
+let micListening = false;
+let micFinalTranscript = '';
+let chatHistory = [];
+let inputHistory = [];
+let inputHistoryIndex = -1;
+let inputHistoryDraft = '';
+
+async function refreshPiHeadlessStatus() {
+  try {
+    const r = await fetch('/api/pi/headless/status');
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || 'offline');
+    piStatus.textContent = `Pi headless: ${data.mic_muted ? 'muted' : 'listening'}${data.speaking ? ' / speaking' : ''}`;
+    piMuteBtn.textContent = data.mic_muted ? 'Unmute Pi Mic' : 'Mute Pi Mic';
+    piPowerBtn.textContent = data.arm_power === true ? 'Arm Power: ON' : data.arm_power === false ? 'Arm Power: OFF' : 'Arm Power: unknown';
+  } catch (_) {
+    piStatus.textContent = 'Pi headless: offline';
+  }
+}
+
+async function controlPi(payload) {
+  const r = await fetch('/api/pi/headless/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) throw new Error(data.error || 'Pi control failed');
+  return data;
+}
+
+async function refreshLedPower() {
+  try {
+    const r = await fetch('/api/led/status');
+    const data = await r.json();
+    ledPowerBtn.textContent = data.power_state === true ? 'LED: ON' : data.power_state === false ? 'LED: OFF' : 'LED: unknown';
+    ledPowerBtn.disabled = false;
+  } catch (_) {
+    ledPowerBtn.textContent = 'LED: unavailable';
+    ledPowerBtn.disabled = true;
+  }
+}
+
+piMuteBtn.addEventListener('click', async () => {
+  try {
+    const data = await fetch('/api/pi/headless/status').then(r => r.json());
+    await controlPi({ action: data.mic_muted ? 'unmute' : 'mute' });
+    await refreshPiHeadlessStatus();
+  } catch (err) {
+    addSystem('Pi control error: ' + err.message, true);
+  }
+});
+
+piPowerBtn.addEventListener('click', async () => {
+  try {
+    await controlPi({ action: 'arm_power_toggle' });
+    await refreshPiHeadlessStatus();
+  } catch (err) {
+    addSystem('Arm power control error: ' + err.message, true);
+  }
+});
+
+ledPowerBtn.addEventListener('click', async () => {
+  try {
+    ledPowerBtn.disabled = true;
+    const status = await fetch('/api/led/status').then(r => r.json());
+    const r = await fetch('/api/led/power', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: status.power_state !== true })
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || 'LED power command failed');
+    await refreshLedPower();
+  } catch (err) {
+    addSystem('LED power error: ' + err.message, true);
+    ledPowerBtn.disabled = false;
+  }
+});
+
+q.addEventListener('keydown', (e) => {
+  if ((e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || inputHistory.length === 0) return;
+
+  e.preventDefault();
+  if (e.key === 'ArrowUp') {
+    if (inputHistoryIndex === -1) inputHistoryDraft = q.value;
+    inputHistoryIndex = Math.min(inputHistoryIndex + 1, inputHistory.length - 1);
+    q.value = inputHistory[inputHistory.length - 1 - inputHistoryIndex];
+  } else {
+    inputHistoryIndex -= 1;
+    if (inputHistoryIndex < 0) {
+      inputHistoryIndex = -1;
+      q.value = inputHistoryDraft;
+    } else {
+      q.value = inputHistory[inputHistory.length - 1 - inputHistoryIndex];
+    }
+  }
+  q.setSelectionRange(q.value.length, q.value.length);
+});
+
+q.addEventListener('input', () => {
+  inputHistoryIndex = -1;
+});
+
+function speechApiCtor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function setMicUi(listening) {
+  micListening = listening;
+  micBtn.textContent = listening ? 'Stop Mic' : 'Start Mic';
+}
+
+function setupSpeechRecognition() {
+  const Ctor = speechApiCtor();
+  if (!Ctor) {
+    micBtn.disabled = true;
+    micBtn.title = 'Speech recognition is not supported in this browser.';
+    return;
+  }
+
+  if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+    addSystem('Mic note: this page is not in a secure context. Many browsers block speech recognition on non-HTTPS IP URLs.', true);
+  }
+
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: 'microphone' }).then((status) => {
+      if (status.state === 'denied') {
+        addSystem('Microphone permission is denied in browser settings for this site. Allow mic access and reload.', true);
+      }
+    }).catch(() => {});
+  }
+
+  recognition = new Ctor();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = 'en-US';
+
+  recognition.onresult = (event) => {
+    if (!micListening) return;
+    let interim = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const text = event.results[i][0].transcript;
+      if (event.results[i].isFinal) micFinalTranscript += text + ' ';
+      else interim += text;
+    }
+    const merged = (micFinalTranscript + interim).trim();
+    if (merged) q.value = merged;
+  };
+
+  recognition.onerror = (event) => {
+    const code = String(event.error || 'unknown');
+    if (code === 'not-allowed' || code === 'service-not-allowed') {
+      addSystem(
+        'Mic error: not allowed. In Edge/Chrome, allow microphone permission for this site. If using an IP URL over HTTP, browser security may block speech recognition; use localhost or HTTPS.',
+        true
+      );
+    } else {
+      addSystem('Mic error: ' + code, true);
+    }
+    setMicUi(false);
+  };
+
+  recognition.onend = () => {
+    setMicUi(false);
+  };
+
+  micBtn.addEventListener('click', async () => {
+    if (!recognition) return;
+    if (micListening) {
+      recognition.stop();
+      setMicUi(false);
+      return;
+    }
+
+    try {
+      micFinalTranscript = '';
+      recognition.start();
+      setMicUi(true);
+      q.focus();
+    } catch (err) {
+      addSystem('Could not start mic: ' + err.message, true);
+      setMicUi(false);
+    }
+  });
+}
+
+function ensureOption(selectEl, value) {
+  if (!value) return;
+  const exists = Array.from(selectEl.options).some(opt => opt.value === value);
+  if (!exists) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = value;
+    selectEl.appendChild(opt);
+  }
+}
+
+async function loadProfiles() {
+  let profiles = ['general'];
+  try {
+    const r = await fetch('/api/memory/profiles');
+    const data = await r.json();
+    if (r.ok && Array.isArray(data.profiles) && data.profiles.length) {
+      profiles = data.profiles;
+    }
+  } catch (err) {
+    addSystem('Could not load profile list. Using local defaults.', true);
+  }
+
+  profileSelect.innerHTML = '';
+  for (const p of profiles) {
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    profileSelect.appendChild(opt);
+  }
+
+  const savedProfile = (localStorage.getItem('luna_profile') || 'general').trim() || 'general';
+  ensureOption(profileSelect, savedProfile);
+  profileSelect.value = savedProfile;
+}
+
+async function loadModels() {
+  let models = [];
+  let defaultModel = '';
+  const curatedModels = [
+    { value: 'llama3.1:70b', label: 'llama3.1:70b (70B preset)' },
+  ];
+  try {
+    const r = await fetch('/api/models');
+    const data = await r.json();
+    if (r.ok && Array.isArray(data.models)) models = data.models;
+    defaultModel = String(data.default_model || '');
+  } catch (err) {
+    addSystem('Could not load model list from Ollama.', true);
+  }
+
+  modelSelect.innerHTML = '';
+  for (const m of models) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    modelSelect.appendChild(opt);
+  }
+
+  for (const preset of curatedModels) {
+    ensureOption(modelSelect, preset.value);
+    const opt = Array.from(modelSelect.options).find(option => option.value === preset.value);
+    if (opt) opt.textContent = preset.label;
+  }
+
+  const savedModel = (localStorage.getItem('luna_model') || defaultModel || '').trim();
+  if (savedModel) ensureOption(modelSelect, savedModel);
+  if (modelSelect.options.length === 0) {
+    const fallback = defaultModel || 'llama-me:latest';
+    ensureOption(modelSelect, fallback);
+  }
+  modelSelect.value = savedModel || modelSelect.options[0].value;
+}
+
+newProfileBtn.addEventListener('click', () => {
+  const raw = prompt('New profile name (example: stock-trading, electronics):', 'general');
+  if (raw === null) return;
+  const value = raw.trim();
+  if (!value) return;
+  ensureOption(profileSelect, value);
+  profileSelect.value = value;
+  localStorage.setItem('luna_profile', value);
+});
+
+profileSelect.addEventListener('change', () => {
+  localStorage.setItem('luna_profile', profileSelect.value || 'general');
+});
+
+modelSelect.addEventListener('change', () => {
+  localStorage.setItem('luna_model', modelSelect.value || '');
+});
+
+ingestBookBtn.addEventListener('click', async () => {
+  const file = (bookFileInput.files || [])[0];
+  if (!file) {
+    addSystem('Pick a book file first (mobi/epub/pdf/txt).', true);
+    return;
+  }
+
+  ingestBookBtn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    fd.append('profile', (profileSelect.value || 'general').trim() || 'general');
+
+    const r = await fetch('/api/ingest-book', {
+      method: 'POST',
+      body: fd
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'book ingestion failed');
+    addSystem(`Ingested ${data.source_name} into profile ${data.profile}: ${data.chunks} chunks.`);
+    bookFileInput.value = '';
+    await loadProfiles();
+  } catch (err) {
+    addSystem('Ingest error: ' + err.message, true);
+  } finally {
+    ingestBookBtn.disabled = false;
+  }
+});
+
+function add(role, content) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (role === 'user' ? 'u' : 'a');
+  if (typeof content === 'string' && content.startsWith('__image__://')) {
+    const snapshot = content.replace('__image__://', '');
+    const [cam, query] = snapshot.split('?', 2);
+    const img = document.createElement('img');
+    img.src = `/api/robot/camera?cam=${encodeURIComponent(cam)}${query ? '&' + query : ''}&t=${Date.now()}`;
+    img.alt = 'Camera snapshot';
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '10px';
+    d.appendChild(img);
+  } else {
+    d.textContent = content;
+  }
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function addSystem(content, isWarn=false) {
+  const d = document.createElement('div');
+  d.className = 'msg a';
+  if (isWarn) d.classList.add('warn');
+  d.textContent = content;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function ext(name) {
+  const parts = name.toLowerCase().split('.');
+  return parts.length > 1 ? parts.pop() : '';
+}
+
+function renderAttachments() {
+  const files = Array.from(fileInput.files || []);
+  attachmentsBox.innerHTML = files.length
+    ? files.map(f => `<span class="pill">${f.name}</span>`).join('')
+    : '';
+}
+
+fileInput.addEventListener('change', renderAttachments);
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(new Error('text read failed'));
+    r.readAsText(file);
+  });
+}
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(new Error('image read failed'));
+    r.readAsDataURL(file);
+  });
+}
+
+async function buildAttachments(files) {
+  const out = [];
+  for (const f of files) {
+    const mime = (f.type || '').toLowerCase();
+    const extension = ext(f.name);
+    if (mime.startsWith('image/')) {
+      const dataUrl = await readFileAsDataURL(f);
+      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      out.push({ kind: 'image', name: f.name, image_base64: base64 });
+      continue;
+    }
+
+    const textLike = mime.startsWith('text/') || ['md','txt','csv','json','yaml','yml','log','py','js','ts','html','css'].includes(extension);
+    if (textLike) {
+      let text = await readFileAsText(f);
+      if (text.length > 12000) text = text.slice(0, 12000) + '\n...[truncated]';
+      out.push({ kind: 'text', name: f.name, content: text });
+      continue;
+    }
+
+    if (extension === 'docx') {
+      const dataUrl = await readFileAsDataURL(f);
+      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      out.push({ kind: 'docx', name: f.name, content: base64 });
+      continue;
+    }
+
+    addSystem(`Skipped unsupported file: ${f.name}`, true);
+  }
+  return out;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (micListening && recognition) {
+    try { recognition.stop(); } catch (_) {}
+    setMicUi(false);
+  }
+  const text = q.value.trim();
+  const files = Array.from(fileInput.files || []);
+  if (!text && files.length === 0) return;
+
+  micFinalTranscript = '';
+  q.value = '';
+  const userText = text || 'Please analyze the attached files.';
+  if (text) {
+    if (inputHistory[inputHistory.length - 1] !== text) inputHistory.push(text);
+    if (inputHistory.length > 50) inputHistory.shift();
+    inputHistoryIndex = -1;
+    add('user', text);
+  } else {
+    addSystem('Sent attachments with no text prompt.');
+  }
+  chatHistory.push({ role: 'user', content: userText });
+
+  send.disabled = true;
+  try {
+    const attachments = await buildAttachments(files);
+    const turnMessages = chatHistory.slice();
+
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: turnMessages,
+        attachments,
+        web_research: !!webResearch?.checked,
+        online_ai: !!bigBrother?.checked,
+        profile: (profileSelect.value || 'general').trim() || 'general',
+        model: (modelSelect.value || '').trim() || null
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'request failed');
+    const reply = data.reply || '';
+    add('assistant', reply);
+    chatHistory.push({ role: 'assistant', content: reply });
+    fileInput.value = '';
+    renderAttachments();
+  } catch (err) {
+    add('assistant', 'Error: ' + err.message);
+  } finally {
+    send.disabled = false;
+    q.focus();
+  }
+});
+
+loadProfiles();
+loadModels();
+setupSpeechRecognition();
+refreshPiHeadlessStatus();
+refreshLedPower();
+setInterval(refreshPiHeadlessStatus, 5000);
+setInterval(refreshLedPower, 5000);
+
+</script>
+</body>
+</html>

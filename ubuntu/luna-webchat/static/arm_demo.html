@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Luna Arm Behaviors Demo</title>
+<style>
+  :root { --bg:#f7f4ef; --card:#fffdf9; --ink:#1f1d1a; --accent:#0f766e; --muted:#6b645c; --warn:#8a4b08; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 18px; }
+  .card { background: var(--card); border: 1px solid #e4dacb; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  button { border:0; background:var(--accent); color:#fff; padding:12px 10px; border-radius:10px; font-weight:600; cursor:pointer; font-size: 14px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:#f1ece1; color:#3e362d; border:1px solid #d8cdbd; }
+  button.warn { background:var(--warn); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; margin-bottom: 10px; }
+  label { font-size: 13px; color: var(--muted); }
+  input[type=range] { width: 140px; }
+  #log { background:#111; color:#c9f7d8; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; padding: 12px; border-radius: 10px; height: 220px; overflow:auto; white-space: pre-wrap; }
+  #statusBar { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .pill { display:inline-block; padding:3px 8px; background:#f4efe7; border:1px solid #e4dacb; border-radius:999px; font-size:12px; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Luna Arm Behaviors Demo</h1>
+  <div class="sub">Behavior-level controls only &mdash; no raw servo commands. Requires the arm's servo power to be on.</div>
+
+  <div class="card">
+    <h2>Power &amp; Status</h2>
+    <div id="statusBar">Status: checking...</div>
+    <div class="row">
+      <button class="ghost" id="powerOn" type="button">Arm Power ON</button>
+      <button class="ghost" id="powerOff" type="button">Arm Power OFF</button>
+      <button class="ghost" id="refreshStatus" type="button">Refresh Status</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Safe Poses</h2>
+    <div class="grid">
+      <button data-behavior="IDLE_SAFE" type="button">Idle Safe</button>
+      <button data-behavior="OFFER_NEAR" type="button">Offer Near</button>
+      <button data-behavior="OFFER_FAR" type="button">Offer Far</button>
+      <button data-behavior="HOLD_CENTER" type="button">Hold Center</button>
+      <button data-behavior="RETRACT_SAFE" type="button">Retract Safe</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Gestures</h2>
+    <div class="row">
+      <label for="energy">Energy</label>
+      <input type="range" id="energy" min="0.15" max="1.2" step="0.05" value="0.5" />
+      <span id="energyVal">0.5</span>
+      <label for="duration">Duration (s)</label>
+      <input type="range" id="duration" min="0.5" max="3" step="0.1" value="1.5" />
+      <span id="durationVal">1.5</span>
+    </div>
+    <div class="grid">
+      <button data-gesture="greet" type="button">Greet (wave)</button>
+      <button data-gesture="explain" type="button">Explain</button>
+      <button data-gesture="think" type="button">Think</button>
+      <button data-gesture="confirm" type="button">Confirm (yes)</button>
+      <button data-gesture="deny" type="button">Deny (no)</button>
+      <button data-gesture="apology" type="button">Apology</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Object Handoff</h2>
+    <div class="row">
+      <button class="warn" id="receiveObject" type="button">Receive Object</button>
+      <button class="warn" id="returnObject" type="button">Return Object</button>
+    </div>
+    <div class="sub">Receive: offers the gripper, waits for an object, grasps it, and verifies the grasp. Return: offers a held object back and releases it.</div>
+  </div>
+
+  <div class="card">
+    <h2>Activity Log</h2>
+    <div id="log">Ready.</div>
+  </div>
+</div>
+
+<script>
+const log = document.getElementById('log');
+const statusBar = document.getElementById('statusBar');
+const energyInput = document.getElementById('energy');
+const durationInput = document.getElementById('duration');
+const energyVal = document.getElementById('energyVal');
+const durationVal = document.getElementById('durationVal');
+const allButtons = () => Array.from(document.querySelectorAll('button'));
+
+function logLine(text) {
+  const time = new Date().toLocaleTimeString();
+  log.textContent = `[${time}] ${text}\n` + log.textContent;
+}
+
+function setBusy(busy) {
+  allButtons().forEach(b => b.disabled = busy);
+}
+
+async function postJson(path, body) {
+  setBusy(true);
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    const data = await r.json().catch(() => ({}));
+    logLine(`${path} -> HTTP ${r.status} ${JSON.stringify(data)}`);
+    return data;
+  } catch (err) {
+    logLine(`${path} -> error: ${err.message}`);
+    return { ok: false, error: err.message };
+  } finally {
+    setBusy(false);
+    refreshStatus();
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/pi/headless/status');
+    const data = await r.json();
+    const power = data.arm_power === true ? 'ON' : data.arm_power === false ? 'OFF' : 'unknown';
+    statusBar.innerHTML =
+      `<span class="pill">arm power: ${power}</span>` +
+      `<span class="pill">behavior: ${data.behavior_state || 'unknown'}</span>` +
+      `<span class="pill">face: ${data.face || '-'}</span>`;
+  } catch (err) {
+    statusBar.textContent = 'Status: unreachable (' + err.message + ')';
+  }
+}
+
+energyInput.addEventListener('input', () => energyVal.textContent = energyInput.value);
+durationInput.addEventListener('input', () => durationVal.textContent = durationInput.value);
+
+document.getElementById('powerOn').addEventListener('click', () => postJson('/api/pi/headless/control', { action: 'arm_power_on' }));
+document.getElementById('powerOff').addEventListener('click', () => postJson('/api/pi/headless/control', { action: 'arm_power_off' }));
+document.getElementById('refreshStatus').addEventListener('click', refreshStatus);
+document.getElementById('receiveObject').addEventListener('click', () => postJson('/api/pi/behavior/receive_object', { timeout_s: 8, retries: 1 }));
+document.getElementById('returnObject').addEventListener('click', () => postJson('/api/pi/behavior/return_object', { timeout_s: 5 }));
+
+document.querySelectorAll('[data-behavior]').forEach(btn => {
+  btn.addEventListener('click', () => postJson('/api/pi/behavior/run', { name: btn.dataset.behavior }));
+});
+document.querySelectorAll('[data-gesture]').forEach(btn => {
+  btn.addEventListener('click', () => postJson('/api/pi/gesture', {
+    intent: btn.dataset.gesture,
+    energy: parseFloat(energyInput.value),
+    duration: parseFloat(durationInput.value)
+  }));
+});
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>
