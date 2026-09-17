@@ -6,11 +6,10 @@
 #include <TFT_eSPI.h>
 #include <esp_heap_caps.h>
 
-// Set these for the Wi-Fi network and Luna server.
-const char *WIFI_SSID = "HOME-4B02";
-const char *WIFI_PASSWORD = "ROTATED-WIFI-PASSWORD-REDACTED";
+// WIFI_SSID, WIFI_PASSWORD, LUNA_TOKEN live in secrets.h (gitignored).
+// Copy secrets.h.example to secrets.h and fill in your own values.
+#include "secrets.h"
 const char *LUNA_URL = "https://172.31.31.106:3010";
-const char *LUNA_TOKEN = "ROTATED-SECRET-REDACTED";
 
 // Backlight enable pin for this ESP32-32E module (per board pinout).
 static const int TFT_BACKLIGHT_PIN = 27;

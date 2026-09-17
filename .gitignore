@@ -20,5 +20,6 @@ backups3/
 *.bak
 .vscode/launch.json
 .DS_Store
+esp32_dashboard/secrets.h
 .venv/
 __pycache__/
