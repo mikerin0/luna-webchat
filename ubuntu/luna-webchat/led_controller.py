@@ -26,6 +26,8 @@ IMAGE_SECONDS = max(1.0, float(os.getenv("LUNA_LED_IMAGE_SECONDS", "4")))
 DEFAULT_LABEL = os.getenv("LUNA_LED_DEFAULT_LABEL", "Luna").strip() or "Luna"
 TOPIC_RAINBOW_MODE = max(0, min(9, int(os.getenv("LUNA_LED_TOPIC_RAINBOW_MODE", "4"))))
 TEXT_LINES = max(1, min(2, int(os.getenv("LUNA_LED_TEXT_LINES", "2"))))
+TEXT_FONT_HEIGHT_RATIO = max(0.25, min(0.55, float(os.getenv("LUNA_LED_TEXT_FONT_HEIGHT_RATIO", "0.44"))))
+PIXEL_ICON_CHANCE = max(0.0, min(1.0, float(os.getenv("LUNA_LED_PIXEL_ICON_CHANCE", "0.30"))))
 CLEAR_AFTER_S = max(0.0, float(os.getenv("LUNA_LED_CLEAR_AFTER_S", "60")))
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 NASDAQ_API = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC"
@@ -88,6 +90,46 @@ def _split_two_lines(message: str) -> list[str]:
     return [" ".join(words[:best_idx]), " ".join(words[best_idx:])]
 
 
+def _compact_caption(prompt: str, reply: str, max_chars: int = 52) -> str:
+    """Choose one readable thought for the sign instead of mirroring chat prose."""
+    clean = re.sub(r"[`*_#]+", "", str(reply or ""))
+    clean = re.sub(r"\s+", " ", clean).strip()
+    sentences = [part.strip(" -:;,.!") for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+    caption = sentences[0] if sentences else ""
+    if not caption:
+        caption = topic_label(prompt)
+    words = caption.split()
+    kept: list[str] = []
+    length = 0
+    for word in words:
+        next_length = length + len(word) + (1 if kept else 0)
+        if next_length > max_chars:
+            break
+        kept.append(word)
+        length = next_length
+    if len(kept) < len(words):
+        return " ".join(kept).rstrip(".,;:") + "..."
+    return " ".join(kept)
+
+
+def _pixel_icon_for(text: str) -> str | None:
+    """Pick a small, self-drawn icon; emoji fonts are unreliable on the sign host."""
+    if random.random() > PIXEL_ICON_CHANCE:
+        return None
+    content = str(text).lower()
+    if re.search(r"\b(sun|clear|weather|warm)\b", content):
+        return "sun"
+    if re.search(r"\b(rain|storm|snow|cloud)\b", content):
+        return "cloud"
+    if re.search(r"\b(happy|great|good|love|thanks)\b", content):
+        return "heart"
+    if re.search(r"\b(robot|luna|arm|ai)\b", content):
+        return "robot"
+    if re.search(r"\b(yes|done|ready|success|correct)\b", content):
+        return "check"
+    return "sparkle"
+
+
 def _rainbow_palette() -> list[tuple[int, int, int]]:
     return [
         (255, 80, 80),
@@ -100,7 +142,23 @@ def _rainbow_palette() -> list[tuple[int, int, int]]:
     ]
 
 
-def _render_text_image(message: str, width: int, height: int, color: str | None, rainbow_mode: int | None):
+def _draw_pixel_icon(draw, icon: str, x: int, y: int, scale: int) -> None:
+    patterns = {
+        "sun": ("..Y..", ".YYY.", "YYYYY", ".YYY.", "..Y.."),
+        "cloud": ("..WWW.", ".WWWWW", "WWWWWW", "..BBBB", ".BBBB."),
+        "heart": ("R.R", "RRR", ".R."),
+        "robot": (".WWW.", "W.B.W", "WWWWW", ".W.W."),
+        "check": ("....G", "...G.", "G.G..", ".G...", "....."),
+        "sparkle": ("..C..", "C.C.C", ".CCC.", "C.C.C", "..C.."),
+    }
+    colors = {"W": (255, 255, 255), "Y": (255, 220, 60), "B": (80, 180, 255), "R": (255, 80, 110), "G": (80, 235, 110), "C": (90, 220, 255)}
+    for row, pattern_row in enumerate(patterns.get(icon, ())):
+        for column, cell in enumerate(pattern_row):
+            if cell != ".":
+                draw.rectangle((x + column * scale, y + row * scale, x + (column + 1) * scale - 1, y + (row + 1) * scale - 1), fill=colors[cell])
+
+
+def _render_text_image(message: str, width: int, height: int, color: str | None, rainbow_mode: int | None, pixel_icon: str | None = None):
     from PIL import Image, ImageDraw, ImageFont
 
     image = Image.new("RGB", (width, height), (0, 0, 0))
@@ -110,7 +168,7 @@ def _render_text_image(message: str, width: int, height: int, color: str | None,
     line_heights: list[int] = []
     line_widths: list[int] = []
     line_offsets: list[int] = []
-    for font_size in range(max(10, int(height * 0.9)), 7, -1):
+    for font_size in range(max(10, int(height * TEXT_FONT_HEIGHT_RATIO)), 7, -1):
         try:
             test_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
         except Exception:
@@ -157,6 +215,42 @@ def _render_text_image(message: str, width: int, height: int, color: str | None,
         else:
             draw.text((x, draw_y), line, font=font, fill=base_color)
         y += line_heights[line_idx] + spacing
+    if pixel_icon:
+        icon_scale = max(2, min(6, height // 12))
+        _draw_pixel_icon(draw, pixel_icon, width - (6 * icon_scale) - 3, 3, icon_scale)
+    return image
+
+
+def _render_progress_image(percent: float, label: str, width: int, height: int, color: str | None):
+    from PIL import Image, ImageDraw, ImageFont
+
+    pct = max(0, min(100, round(percent)))
+    image = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    base_color = _rgb_from_hex(color or COLOR)
+
+    caption = f"{label} {pct}%".strip()
+    font = ImageFont.load_default()
+    for font_size in range(max(10, int(height * 0.4)), 7, -1):
+        try:
+            test_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except Exception:
+            test_font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), caption, font=test_font)
+        if (bbox[2] - bbox[0]) <= width - 4:
+            font = test_font
+            break
+    bbox = draw.textbbox((0, 0), caption, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text((max(0, (width - text_w) // 2), max(0, height // 4 - text_h // 2 - bbox[1])), caption, font=font, fill=base_color)
+
+    # Bar occupies the lower portion of the panel, label/percent sits above it.
+    bar_x0, bar_x1 = 3, width - 4
+    bar_y0, bar_y1 = int(height * 0.55), height - 4
+    draw.rectangle((bar_x0, bar_y0, bar_x1, bar_y1), outline=base_color, width=1)
+    fill_x1 = bar_x0 + int((bar_x1 - bar_x0 - 2) * (pct / 100.0))
+    if fill_x1 > bar_x0 + 1:
+        draw.rectangle((bar_x0 + 1, bar_y0 + 1, fill_x1, bar_y1 - 1), fill=base_color)
     return image
 
 
@@ -405,7 +499,7 @@ def stop_gpu_mode() -> None:
     _cancel_gpu_task()
 
 
-async def display_text(text: str, color: str | None = None, rainbow_mode: int | None = None, schedule_clear: bool = True) -> bool:
+async def display_text(text: str, color: str | None = None, rainbow_mode: int | None = None, schedule_clear: bool = True, pixel_icon: str | None = None) -> bool:
     """Display text on the configured sign, returning False on any device error."""
     message = " ".join(str(text).split())[:MAX_CHARS].strip()
     if not message:
@@ -422,7 +516,7 @@ async def display_text(text: str, color: str | None = None, rainbow_mode: int | 
 
             async with DeviceSession(ADDRESS) as session:
                 info = session.get_device_info()
-                frame = _render_text_image(message, int(info.width), int(info.height), color, rainbow_mode)
+                frame = _render_text_image(message, int(info.width), int(info.height), color, rainbow_mode, pixel_icon)
                 await _send_pil_image(session, frame)
                 globals()["_last_text_frame"] = frame.copy()
             if schedule_clear:
@@ -466,7 +560,33 @@ async def set_power(on: bool) -> bool:
 
 
 async def display_reply(reply: str) -> bool:
-    return await display_text(reply)
+    return await display_text(_compact_caption("", reply), pixel_icon=_pixel_icon_for(reply))
+
+
+async def display_progress(percent: float, label: str = "", color: str | None = None) -> bool:
+    """Show a bar-graph progress meter for a long-running background job."""
+    if not ENABLED:
+        return False
+    if DRY_RUN:
+        print(f"[LED] dry-run progress: {label} {round(max(0, min(100, percent)))}%")
+        return True
+
+    async with _lock:
+        try:
+            from pypixelcolor.lib.device_session import DeviceSession
+
+            async with DeviceSession(ADDRESS) as session:
+                info = session.get_device_info()
+                frame = _render_progress_image(percent, label, int(info.width), int(info.height), color)
+                await _send_pil_image(session, frame)
+                globals()["_last_text_frame"] = frame.copy()
+            _cancel_clock_task()
+            _cancel_gpu_task()
+            _cancel_clear_task()
+            return True
+        except Exception as exc:
+            print(f"[LED] progress display failed: {exc}")
+            return False
 
 
 def image_subject(prompt: str) -> str | None:
@@ -699,14 +819,14 @@ async def display_image_url(url: str) -> bool:
 
 
 async def display_companion(prompt: str, reply: str) -> bool:
-    """Show a relevant image briefly, then display only a small topic label."""
+    """Show a relevant image briefly, then a concise companion caption."""
     subject = image_subject(prompt) if IMAGES_ENABLED else None
     if subject:
         image_url = await _find_image_url(subject)
         if image_url and await display_image_url(image_url):
             await asyncio.sleep(IMAGE_SECONDS)
-    label = topic_label(prompt, subject)
-    return await display_text(label, rainbow_mode=TOPIC_RAINBOW_MODE)
+    caption = _compact_caption(prompt, reply)
+    return await display_text(caption, rainbow_mode=TOPIC_RAINBOW_MODE, pixel_icon=_pixel_icon_for(f"{prompt} {reply}"))
 
 
 async def display_requested(prompt: str) -> bool:
@@ -735,4 +855,4 @@ async def display_requested(prompt: str) -> bool:
         image_url = await _find_image_url(subject)
         if image_url and await display_image_url(image_url):
             await asyncio.sleep(IMAGE_SECONDS)
-    return await display_text(label)
+    return await display_text(label, pixel_icon=_pixel_icon_for(prompt))

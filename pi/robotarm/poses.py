@@ -3,7 +3,7 @@
 
 # Neutral/home servo positions, reused by the behavior layer (brain.py) as the
 # baseline that gesture deltas are applied against.
-NEUTRAL_POSE = {1: 1500, 2: 1500, 3: 2500, 4: 2209, 5: 500, 6: 1500}
+NEUTRAL_POSE = {1: 1500, 2: 1500, 3: 2218, 4: 2209, 5: 500, 6: 1500}
 
 POSES = {
     # Sequential, one-servo-at-a-time command lists:
@@ -27,12 +27,7 @@ POSES = {
         (5, 1121, 2500),
     ],
     "sleep": [
-        (6, 1500, 1000),
-        (1, 1500, 200),
-        (2, 1500, 200),
-        (3, 2021, 100),
-        (4, 2170, 1000),
-        (5, 1800, 1000),
+        {"servos": dict(NEUTRAL_POSE), "time_ms": 1200},
     ],
     "nod": [
         (1, 2200, 500),
@@ -174,6 +169,11 @@ POSES = {
         {"pose": "idle_safe"},
     ],
 }
+
+# power_on_and_rest() runs this right after enabling servo power; reuse "home"
+# since it's already sequenced to avoid mechanical interference on power-up.
+POSES["rest"] = POSES["home"]
+
 
 def get_pose(name):
     return list(POSES.get(str(name).lower(), []))
