@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import led_controller
 from config import MEMORY_TOP_K, MODEL, OLLAMA_URL, SYSTEM_PROMPT
 from memory import _extract_docx_text, _identity_reply, _memory_context, _normalize_profile, _store_memory
+from moon import moon_phase_reply, moon_phase_requested
 from online_ai import _call_online_ai, _wants_big_brother, get_big_brother_mode
 from pc_control import _handle_pc_command
 from pi_control import (
@@ -91,6 +92,12 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
       await _store_memory(profile, "assistant", reply)
       return {"reply": reply}
 
+    if moon_phase_requested(last_user):
+      reply = moon_phase_reply(last_user)
+      await _store_memory(profile, "user", last_user)
+      await _store_memory(profile, "assistant", reply)
+      return {"reply": reply}
+
     if _lcd_request(last_user) and led_controller.is_gpu_request(last_user):
       lcd_reply = "Showing live GPU usage on the LCD. It will update every few seconds until another display command replaces it."
       await _store_memory(profile, "user", last_user)
@@ -164,7 +171,9 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         "this system prompt is present on every turn regardless of phrasing, but that does not mean an action ran. "
         "If Mike asks you to do something on the PC without using the 'robot' keyword or /pc form, do not claim you did it or that anything opened, ran, or changed; "
         "instead say plainly that nothing happened and tell him to start the request with 'robot' to actually run it. "
-        "Persistent conversation memory is enabled. Use the supplied memory context and recent memories when answering questions about what you remember, and say that you remember relevant past conversations when memory context supports it."
+        "Persistent conversation memory is enabled. Only claim to remember something, or say phrases like 'I remember' or 'let me recall', when the supplied memory context or recent messages literally contain that fact or a prior answer to it. "
+        "If no memory context was supplied for this turn, or it only contains a past question with no answer, say plainly that you don't have a stored answer for this instead of inventing one. "
+        "Never fabricate a specific fact you have no real source for (dates, calendar/astronomical data like moon phases, calculations, prior conversations) just to sound confident or to satisfy the memory instruction above. If you do not know, say that you do not know."
           " Book excerpts are reference material, not web research. Do not cite or attribute URLs found inside book excerpts as web sources."
       ),
     },
@@ -177,6 +186,17 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     memory_ctx = await _memory_context(profile, last_user, MEMORY_TOP_K)
     if memory_ctx:
       payload_messages.append({"role": "system", "content": memory_ctx})
+      if "assistant:" not in memory_ctx:
+        payload_messages.append(
+          {
+            "role": "system",
+            "content": (
+              "The memory snippets above only show past user messages, not a past answer from you. "
+              "Do not say 'I remember answering' or invent what you supposedly said before. "
+              "Answer the question fresh, or say you don't know, using no fabricated prior answer."
+            ),
+          }
+        )
 
     if last_user and _server_monitoring_requested(last_user):
       stats_ctx = await _server_stats_context()
@@ -318,6 +338,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
   if last_user:
     await _store_memory(profile, "user", last_user)
+    if reply:
+      await _store_memory(profile, "assistant", reply)
 
   if not _queue_led_request(last_user):
     _queue_led_companion(last_user, reply)
