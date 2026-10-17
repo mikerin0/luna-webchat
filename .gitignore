@@ -7,6 +7,7 @@ __pycache__/
 venv/
 *.hef
 *.onnx
+kokoro-voices/voices-v1.0.bin
 *.log
 hailort*.log
 pyhailort.log
@@ -21,5 +22,6 @@ backups3/
 .vscode/launch.json
 .DS_Store
 esp32_dashboard/secrets.h
+esp32_voicebox/secrets.h
 .venv/
 __pycache__/

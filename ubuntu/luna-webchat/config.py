@@ -3,6 +3,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OPENWEBUI_URL = os.getenv("LUNA_OPENWEBUI_URL", "http://127.0.0.1:3000").strip()
+OPENWEBUI_API_KEY = os.getenv("LUNA_OPENWEBUI_API_KEY", "").strip()
 MODEL = os.getenv("LUNA_MODEL", "llama-me:latest")
 ASSISTANT_NAME = os.getenv("LUNA_ASSISTANT_NAME", "Luna")
 USER_NAME = os.getenv("LUNA_USER_NAME", "Mike")
@@ -47,6 +49,17 @@ LUNA_PI_DETECT_CLOSEUP_TABLE = os.getenv("LUNA_PI_DETECT_CLOSEUP_TABLE", "true")
 LUNA_ARM_GESTURES_ENABLED = os.getenv("LUNA_ARM_GESTURES_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS = int(os.getenv("LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS", "220"))
 ESP32_TOKEN = os.getenv("LUNA_ESP32_TOKEN", "").strip()
+TTS_ENGINE = os.getenv("LUNA_TTS_ENGINE", "piper").strip().lower()  # "piper" or "kokoro"
+WAKE_WORD = os.getenv("LUNA_WAKE_WORD", "luna").strip().lower()
+# Common Whisper mis-transcriptions of WAKE_WORD, treated as equivalent hits.
+# Expand this list as testing turns up more near-misses -- "loon" was the
+# first one observed (the "-na" ending getting clipped/lost).
+WAKE_WORD_VARIANTS = [
+  v.strip().lower()
+  for v in os.getenv("LUNA_WAKE_WORD_VARIANTS", "luna,loon").split(",")
+  if v.strip()
+]
+TRANSCRIBE_LANGUAGE = os.getenv("LUNA_TRANSCRIBE_LANGUAGE", "en").strip()
 ONLINE_AI_ENABLED = os.getenv("LUNA_ONLINE_AI_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ONLINE_AI_URL = os.getenv("LUNA_ONLINE_AI_URL", "https://api.openai.com/v1/chat/completions").strip()
 ONLINE_AI_API_KEY = os.getenv("LUNA_ONLINE_AI_API_KEY", "").strip()

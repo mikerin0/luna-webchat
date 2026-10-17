@@ -20,7 +20,7 @@ from pi_control import (
     _queue_arm_gesture,
     _queue_lcd_gpu_monitor,
 )
-from led import _queue_led_companion, _queue_led_request
+from led import _queue_led_companion, _queue_led_request, _queue_led_thinking
 from system_stats import (
     _linux_stats_reply,
     _linux_stats_requested,
@@ -76,6 +76,12 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     if not _queue_led_request(last_user):
       _queue_led_companion(last_user, forced)
     return {"reply": forced}
+
+  # Not an instant-reply shortcut -- whatever comes next takes real time, so
+  # show the thinking animation now. It gets naturally overwritten by
+  # whichever _queue_led_companion/_queue_led_request call fires once a
+  # reply is actually ready.
+  _queue_led_thinking()
 
   if last_user:
     mic_reply = await _handle_mic_command(last_user)

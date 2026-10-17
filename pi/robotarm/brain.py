@@ -694,55 +694,87 @@ def sleep_arm() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Ultrasonic distance helper — shared, serialised, cached
+# Distance sensor helper — shared, serialised, cached
 # ---------------------------------------------------------------------------
+# Backed by a VL53L1X ToF sensor over I2C (replaces the old HC-SR04 ultrasonic,
+# which never gave reliable readings and was removed from the arm). Function
+# name/signature/cache kept as-is since ~15 call sites throughout this file
+# treat it as "distance under the claw in cm" regardless of sensor hardware.
 # Single lock so gui.py's 150 ms slider poll and smart_table_take never
-# claim the same lgpio pins simultaneously.
+# claim the same sensor simultaneously.
 _ultrasonic_hw_lock = threading.Lock()
 _ultrasonic_cache   = {"cm": None, "t": 0.0}
+_tof_sensor = None
+# A held-open VL53L1X session has been observed to silently degrade to
+# permanent SignalFail/OutOfBounds after a while, even though a brand new
+# connection to the same sensor reads correctly right away. Self-heal by
+# forcing a reconnect if nothing valid has come back in a while, instead of
+# requiring a service restart.
+_tof_last_success_t = 0.0
+_TOF_STALE_RECONNECT_S = 4.0
+
+
+def _close_tof_sensor():
+    global _tof_sensor
+    if _tof_sensor is not None:
+        try:
+            _tof_sensor.stop_ranging()
+        except Exception:
+            pass
+        try:
+            _tof_sensor.close()
+        except Exception:
+            pass
+    _tof_sensor = None
+
+
+def _get_tof_sensor():
+    """Lazily open and start ranging on the VL53L1X once; reused across reads."""
+    global _tof_sensor, _tof_last_success_t
+    if _tof_sensor is not None:
+        return _tof_sensor
+    try:
+        import VL53L1X
+        sensor = VL53L1X.VL53L1X(
+            i2c_bus=int(getattr(config, "TOF_I2C_BUS", 1)),
+            i2c_address=int(getattr(config, "TOF_I2C_ADDRESS", 0x29)),
+        )
+        sensor.open()
+        sensor.start_ranging(int(getattr(config, "TOF_DISTANCE_MODE", 1)))
+        _tof_sensor = sensor
+        _tof_last_success_t = time.time()
+    except Exception as exc:
+        print(f"[Brain] ToF sensor init failed: {exc}")
+        _tof_sensor = None
+    return _tof_sensor
 
 
 def read_ultrasonic_cm(timeout_s: float = 0.04) -> float | None:
-    """Serialised single HC-SR04 read.  Updates shared cache.
-    Returns distance in cm, or None on timeout / error."""
-    trig_pin = int(getattr(config, "ULTRASONIC_TRIGGER_PIN_BCM", 23))
-    echo_pin = int(getattr(config, "ULTRASONIC_ECHO_PIN_BCM", 24))
+    """Serialised VL53L1X ToF read.  Updates shared cache.
+    Returns distance in cm, or None on sensor error / no valid target."""
+    global _tof_last_success_t
     with _ultrasonic_hw_lock:
+        sensor = _get_tof_sensor()
+        if sensor is None:
+            return None
         try:
-            import lgpio
-            h = lgpio.gpiochip_open(0)
-            try:
-                lgpio.gpio_claim_output(h, trig_pin)
-                lgpio.gpio_claim_input(h, echo_pin)
-                lgpio.gpio_write(h, trig_pin, 0)
-                time.sleep(0.000002)
-                lgpio.gpio_write(h, trig_pin, 1)
-                time.sleep(0.000010)
-                lgpio.gpio_write(h, trig_pin, 0)
-                t0 = time.time()
-                while lgpio.gpio_read(h, echo_pin) == 0:
-                    if time.time() - t0 > timeout_s:
-                        return None
-                pulse_start = time.time()
-                while lgpio.gpio_read(h, echo_pin) == 1:
-                    if time.time() - pulse_start > timeout_s:
-                        return None
-                pulse_end = time.time()
-                dist = round((pulse_end - pulse_start) * 17150.0, 2)
-                _ultrasonic_cache["cm"] = dist
-                _ultrasonic_cache["t"]  = time.time()
-                return dist
-            finally:
-                try:
-                    lgpio.gpio_free(h, trig_pin)
-                except Exception:
-                    pass
-                try:
-                    lgpio.gpio_free(h, echo_pin)
-                except Exception:
-                    pass
-                lgpio.gpiochip_close(h)
-        except Exception:
+            status = sensor.get_range_status()
+            distance_mm = sensor.get_distance()
+            if status != 0 or distance_mm is None or distance_mm < 0:
+                if time.time() - _tof_last_success_t > _TOF_STALE_RECONNECT_S:
+                    print("[Brain] ToF sensor stale, reconnecting")
+                    _close_tof_sensor()
+                    _tof_last_success_t = time.time()
+                return None
+            _tof_last_success_t = time.time()
+            dist = round(distance_mm / 10.0, 2)
+            _ultrasonic_cache["cm"] = dist
+            _ultrasonic_cache["t"]  = time.time()
+            return dist
+        except Exception as exc:
+            _close_tof_sensor()
+            _tof_last_success_t = time.time()
+            print(f"[Brain] ToF read failed: {exc}")
             return None
 
 
@@ -1305,7 +1337,7 @@ def receive_object(timeout_s: float = 8.0, retries: int = 1) -> dict:
                 dist = read_ultrasonic_cm()
                 if dist is not None and dist <= near_cm:
                     candidate_seen = True
-                    _log_behavior("sensor_check", sensor="ultrasonic", dist_cm=dist)
+                    _log_behavior("sensor_check", sensor="tof", dist_cm=dist)
                     break
                 try:
                     import table_detect
@@ -1394,6 +1426,14 @@ def return_object(timeout_s: float = 8.0) -> dict:
         time.sleep(0.3)
 
         delta_cm = float(getattr(config, "BEHAVIOR_HANDOFF_DELTA_CM", 1.5))
+
+        # A gripped object sits in the sensor's dead zone / blocks its beam, so the ToF
+        # sensor reads invalid the whole time something is held - there's no usable
+        # "hand approaching" signal to gate on here. Use a fixed pause instead, giving
+        # time to reach in before releasing.
+        release_delay_s = float(getattr(config, "BEHAVIOR_RETURN_RELEASE_DELAY_S", 2.5))
+        time.sleep(max(0.0, release_delay_s))
+
         baseline_dist = read_ultrasonic_cm()
         open_claw(time_ms=int(max(400, min(1500, float(timeout_s) * 60))))
 
@@ -1403,7 +1443,7 @@ def return_object(timeout_s: float = 8.0) -> dict:
             dist = read_ultrasonic_cm()
             if dist is not None and baseline_dist is not None and (dist - baseline_dist) > delta_cm:
                 released = True
-                _log_behavior("sensor_check", sensor="ultrasonic_release", dist_cm=dist)
+                _log_behavior("sensor_check", sensor="tof_release", dist_cm=dist)
                 break
             time.sleep(0.1)
 

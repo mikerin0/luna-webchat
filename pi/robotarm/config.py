@@ -130,8 +130,14 @@ GRIPPER_SWITCH_CONFIRM_INTERVAL_MS = 8
 # start-of-close baseline as a stop trigger.
 # Set False to avoid stopping too early from spring/lever vibration.
 GRIPPER_SWITCH_TRIGGER_ON_CHANGE = False
-# Optional tiny extra squeeze after confirmed switch trigger for better grip.
-GRIPPER_TRIGGER_EXTRA_CLOSE_US = 15
+# Optional extra squeeze after confirmed switch trigger for better grip.
+# Only affects receive_object(), which uses this default; smart_table_take and
+# the legacy behavior pass their own explicit values and are unaffected.
+# Always clamped to GRIPPER_HARD_CLOSE_MAX regardless of this value, so this is
+# safe to raise; typical trigger positions observed around 2130-2170, leaving
+# headroom under the 2270 hard limit. Raised from 15 (original) -> 25 (too
+# subtle to feel) -> 60.
+GRIPPER_TRIGGER_EXTRA_CLOSE_US = 60
 GRIPPER_TRIGGER_EXTRA_CLOSE_TIME_MS = 120
 
 # --- Claw cycle timing (used by GUI Claw Cycle toggle) ---
@@ -223,9 +229,12 @@ VOICE_SYSTEM_PROMPT = (
         "Keep responses short: 1 to 3 sentences."
 )
 
-# --- Ultrasonic auto-take ---
-ULTRASONIC_TRIGGER_PIN_BCM = 23
-ULTRASONIC_ECHO_PIN_BCM = 24
+# --- Distance sensor (VL53L1X ToF, replaces the old HC-SR04 ultrasonic) ---
+TOF_I2C_BUS = 1
+TOF_I2C_ADDRESS = 0x29
+# 1 = short range (best accuracy/ambient immunity under ~1.3m - matches all the
+# cm thresholds below), 2 = medium, 3 = long.
+TOF_DISTANCE_MODE = 1
 # Slider-only smoothing factor (0.0-1.0). Lower values are steadier.
 ULTRASONIC_SLIDER_SMOOTH_ALPHA = 0.22
 AUTO_TAKE_ENABLED_STARTUP = False
@@ -366,6 +375,11 @@ BEHAVIOR_OBSTACLE_STOP_CM = 3.0
 BEHAVIOR_HANDOFF_NEAR_CM = 12.0
 # Ultrasonic delta (cm) required to count as a grasp/release confirmation signal.
 BEHAVIOR_HANDOFF_DELTA_CM = 1.5
+# return_object(): fixed pause at the offer pose before releasing, giving time to
+# reach in. The ToF sensor can't gate this directly - a gripped object sits in its
+# dead zone / blocks its beam the whole time it's held, so there's no live "hand
+# approaching" signal available while holding. Tune this by feel.
+BEHAVIOR_RETURN_RELEASE_DELAY_S = 2.5
 # Clamp bounds for gesture() energy scaling (0..this range maps small..large motion).
 BEHAVIOR_GESTURE_MIN_ENERGY = 0.15
 BEHAVIOR_GESTURE_MAX_ENERGY = 1.2

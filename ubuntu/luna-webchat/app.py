@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from routers import chat, esp32, led, memory, pages, pi, system
+from routers import chat, esp32, led, memory, pages, pi, system, voicebox
 
 app = FastAPI(title="Luna Local Chat")
 
@@ -11,3 +11,4 @@ app.include_router(pages.router)
 app.include_router(chat.router)
 app.include_router(led.router)
 app.include_router(memory.router)
+app.include_router(voicebox.router)

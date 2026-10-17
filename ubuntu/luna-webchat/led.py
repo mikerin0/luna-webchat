@@ -11,6 +11,13 @@ def _queue_led_reply(reply: str) -> None:
   task.add_done_callback(lambda completed: completed.exception())
 
 
+def _queue_led_thinking() -> None:
+  if not led_controller.ENABLED:
+    return
+  task = asyncio.create_task(led_controller.display_thinking_animation())
+  task.add_done_callback(lambda completed: completed.exception())
+
+
 def _queue_led_companion(prompt: str, reply: str) -> None:
   if not led_controller.ENABLED:
     return

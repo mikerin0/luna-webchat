@@ -28,6 +28,8 @@ TOPIC_RAINBOW_MODE = max(0, min(9, int(os.getenv("LUNA_LED_TOPIC_RAINBOW_MODE", 
 TEXT_LINES = max(1, min(2, int(os.getenv("LUNA_LED_TEXT_LINES", "2"))))
 TEXT_FONT_HEIGHT_RATIO = max(0.25, min(0.55, float(os.getenv("LUNA_LED_TEXT_FONT_HEIGHT_RATIO", "0.44"))))
 PIXEL_ICON_CHANCE = max(0.0, min(1.0, float(os.getenv("LUNA_LED_PIXEL_ICON_CHANCE", "0.30"))))
+ICON_SECONDS = max(0.5, float(os.getenv("LUNA_LED_ICON_SECONDS", "1.5")))
+THINKING_ANIMATION_ENABLED = os.getenv("LUNA_LED_THINKING_ANIMATION", "true").strip().lower() in {"1", "true", "yes", "on"}
 CLEAR_AFTER_S = max(0.0, float(os.getenv("LUNA_LED_CLEAR_AFTER_S", "60")))
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 NASDAQ_API = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC"
@@ -502,12 +504,12 @@ def stop_gpu_mode() -> None:
 async def display_text(text: str, color: str | None = None, rainbow_mode: int | None = None, schedule_clear: bool = True, pixel_icon: str | None = None) -> bool:
     """Display text on the configured sign, returning False on any device error."""
     message = " ".join(str(text).split())[:MAX_CHARS].strip()
-    if not message:
+    if not message and not pixel_icon:
         return False
     if not ENABLED:
         return False
     if DRY_RUN:
-        print(f"[LED] dry-run: {message} color={color or COLOR} rainbow={rainbow_mode if rainbow_mode is not None else 0}")
+        print(f"[LED] dry-run: {message or f'<icon:{pixel_icon}>'} color={color or COLOR} rainbow={rainbow_mode if rainbow_mode is not None else 0}")
         return True
 
     async with _lock:
@@ -560,7 +562,10 @@ async def set_power(on: bool) -> bool:
 
 
 async def display_reply(reply: str) -> bool:
-    return await display_text(_compact_caption("", reply), pixel_icon=_pixel_icon_for(reply))
+    icon = _pixel_icon_for(reply)
+    if icon and await display_text("", pixel_icon=icon, schedule_clear=False):
+        await asyncio.sleep(ICON_SECONDS)
+    return await display_text(_compact_caption("", reply))
 
 
 async def display_progress(percent: float, label: str = "", color: str | None = None) -> bool:
@@ -818,15 +823,107 @@ async def display_image_url(url: str) -> bool:
                 pass
 
 
+# Galloping-horse "thinking" animation -- a simple pixel silhouette that runs
+# left-to-right across the panel. Drawn with plain lines/polygons rather than
+# a hand-placed pixel grid since an organic horse shape doesn't lend itself
+# to the small ASCII-pattern style used by _draw_pixel_icon.
+_GALLOP_PHASES = [
+    (3, -3),   # legs splayed (suspension phase)
+    (0, 0),    # gathered under the body
+    (-2, 2),   # crossing over
+    (0, 0),    # gathered again
+]
+_HORSE_COLOR = (210, 160, 90)
+
+
+def _draw_horse(draw: Any, ox: int, oy: int, front_dx: int, back_dx: int, ground_y: int, color) -> None:
+    def pt(x: int, y: int) -> tuple[int, int]:
+        return (ox + x, oy + y)
+
+    def line(x0: int, y0: int, x1: int, y1: int) -> None:
+        draw.line([pt(x0, y0), pt(x1, y1)], fill=color, width=1)
+
+    def poly(points: list[tuple[int, int]]) -> None:
+        draw.polygon([pt(x, y) for x, y in points], fill=color)
+
+    poly([(0, 6), (2, 4), (9, 3), (12, 5), (12, 8), (9, 9), (2, 9), (0, 8)])  # body
+    poly([(10, 4), (13, 1), (15, 0), (15, 2), (13, 4), (11, 6)])  # neck + head
+    line(14, 0, 15, -1)  # ear
+    line(11, 1, 13, 3)  # mane
+    line(1, 5, -2, 2)  # tail
+    line(10, 8, 10 + front_dx, ground_y - oy)
+    line(9, 9, 9 + front_dx - 1, ground_y - oy)
+    line(2, 8, 2 + back_dx, ground_y - oy)
+    line(1, 9, 1 + back_dx - 1, ground_y - oy)
+
+
+def _build_horse_gif(width: int, height: int) -> str:
+    """Renders a looping galloping-horse animation sized for the panel, writes
+    it to a temp .gif file, and returns the path (caller must unlink it)."""
+    from PIL import Image, ImageDraw
+
+    num_frames = 12
+    ground_y = height - 4
+    oy = max(0, (height - 12) // 2)
+    frames = []
+    for i in range(num_frames):
+        img = Image.new("RGB", (width, height), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        front_dx, back_dx = _GALLOP_PHASES[i % len(_GALLOP_PHASES)]
+        t = i / num_frames
+        x = int(-14 + t * (width + 14))
+        _draw_horse(draw, x, oy, front_dx, back_dx, ground_y, _HORSE_COLOR)
+        frames.append(img)
+
+    fd, temp_path = tempfile.mkstemp(suffix=".gif")
+    os.close(fd)
+    frames[0].save(temp_path, format="GIF", save_all=True, append_images=frames[1:], duration=90, loop=0)
+    return temp_path
+
+
+async def display_thinking_animation() -> bool:
+    """Shows the galloping-horse animation while a reply is being generated.
+    Fire-and-forget: whatever comes next (image/icon/caption) just overwrites
+    it on the device once the real reply is ready."""
+    if not ENABLED or not THINKING_ANIMATION_ENABLED:
+        return False
+    if DRY_RUN:
+        print("[LED] dry-run: thinking animation (galloping horse)")
+        return True
+    temp_path = None
+    try:
+        from pypixelcolor.commands.send_image import send_image
+        from pypixelcolor.lib.device_session import DeviceSession
+
+        async with _lock:
+            async with DeviceSession(ADDRESS) as session:
+                info = session.get_device_info()
+                temp_path = _build_horse_gif(int(info.width), int(info.height))
+                await session.execute_command(send_image, temp_path, resize_method="fit")
+        return True
+    except Exception as exc:
+        print(f"[LED] thinking animation failed: {exc}")
+        return False
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 async def display_companion(prompt: str, reply: str) -> bool:
-    """Show a relevant image briefly, then a concise companion caption."""
+    """Show a relevant image briefly, then an icon flash, then a concise companion caption."""
     subject = image_subject(prompt) if IMAGES_ENABLED else None
     if subject:
         image_url = await _find_image_url(subject)
         if image_url and await display_image_url(image_url):
             await asyncio.sleep(IMAGE_SECONDS)
+    icon = _pixel_icon_for(f"{prompt} {reply}")
+    if icon and await display_text("", pixel_icon=icon, schedule_clear=False):
+        await asyncio.sleep(ICON_SECONDS)
     caption = _compact_caption(prompt, reply)
-    return await display_text(caption, rainbow_mode=TOPIC_RAINBOW_MODE, pixel_icon=_pixel_icon_for(f"{prompt} {reply}"))
+    return await display_text(caption, rainbow_mode=TOPIC_RAINBOW_MODE)
 
 
 async def display_requested(prompt: str) -> bool:
@@ -855,4 +952,7 @@ async def display_requested(prompt: str) -> bool:
         image_url = await _find_image_url(subject)
         if image_url and await display_image_url(image_url):
             await asyncio.sleep(IMAGE_SECONDS)
-    return await display_text(label, pixel_icon=_pixel_icon_for(prompt))
+    icon = _pixel_icon_for(prompt)
+    if icon and await display_text("", pixel_icon=icon, schedule_clear=False):
+        await asyncio.sleep(ICON_SECONDS)
+    return await display_text(label)
