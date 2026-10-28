@@ -8,19 +8,22 @@ from pydantic import BaseModel
 
 import led_controller
 from config import MEMORY_TOP_K, MODEL, OLLAMA_URL, SYSTEM_PROMPT
+from display_target import _detect_display_target
 from memory import _extract_docx_text, _identity_reply, _memory_context, _normalize_profile, _store_memory
 from moon import moon_phase_reply, moon_phase_requested
 from online_ai import _call_online_ai, _wants_big_brother, get_big_brother_mode
-from pc_control import _handle_pc_command
+from pc_control import _display_answer_on_pc, _display_image_on_pc, _handle_pc_command
 from pi_control import (
+    _capture_pi_camera_image,
     _handle_mic_command,
     _handle_pi_camera_query,
     _infer_gesture_intent,
     _lcd_request,
     _queue_arm_gesture,
+    _queue_lcd_display_answer,
     _queue_lcd_gpu_monitor,
 )
-from led import _queue_led_companion, _queue_led_request, _queue_led_thinking
+from led import _queue_led_companion, _queue_led_display_answer, _queue_led_request, _queue_led_thinking
 from system_stats import (
     _linux_stats_reply,
     _linux_stats_requested,
@@ -83,7 +86,27 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
   # reply is actually ready.
   _queue_led_thinking()
 
+  display_target: str | None = None
   if last_user:
+    # "<question>, display on led/lcd/pc screen" -- strip the display
+    # instruction so the LLM sees a clean question, and remember the target
+    # so the reply can be routed there once it's computed, at the end.
+    # Step aside for the specialized topics below (live GPU monitor,
+    # nasdaq/weather/clock) -- those have dedicated, more accurate handling
+    # than routing through the general LLM, so let them run on the
+    # original, unstripped text as before.
+    candidate_target, candidate_stripped = _detect_display_target(last_user)
+    if candidate_target:
+      is_specialized_topic = (
+        led_controller.is_gpu_request(last_user)
+        or led_controller.is_nasdaq_request(last_user)
+        or led_controller.is_weather_request(last_user)
+        or led_controller.is_clock_request(last_user)
+      )
+      if not is_specialized_topic:
+        display_target = candidate_target
+        last_user = candidate_stripped
+
     mic_reply = await _handle_mic_command(last_user)
     if mic_reply is not None:
       await _store_memory(profile, "user", last_user)
@@ -140,6 +163,22 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     pi_camera_reply = await _handle_pi_camera_query(last_user)
     if pi_camera_reply is not None:
       await _store_memory(profile, "user", last_user)
+      image_match = re.match(r"^__image__://(\d+)\?annotated=([01])$", pi_camera_reply)
+      if display_target == "pc" and image_match:
+        camera_index = int(image_match.group(1))
+        annotated = image_match.group(2) == "1"
+        image_b64, err = await _capture_pi_camera_image(camera_index, annotated)
+        if image_b64:
+          pc_result = await _display_image_on_pc(image_b64, f"Camera {camera_index + 1}")
+          reply = (
+            f"Displaying the camera {camera_index + 1} snapshot on the PC screen."
+            if pc_result.lower().startswith("windows action succeeded")
+            else f"I captured the snapshot but couldn't display it on the PC screen: {pc_result}"
+          )
+        else:
+          reply = f"I couldn't capture the camera snapshot: {err}"
+        await _store_memory(profile, "assistant", reply)
+        return {"reply": reply}
       if not _queue_led_request(last_user):
         _queue_led_companion(last_user, pi_camera_reply)
       return {"reply": pi_camera_reply}
@@ -184,6 +223,19 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
       ),
     },
   ]
+  if display_target:
+    payload_messages.append(
+      {
+        "role": "system",
+        "content": (
+          "Mike asked for this answer to be displayed on a small physical screen "
+          f"(the {display_target.upper()}), not just spoken. Respond with ONLY the direct "
+          "answer itself -- no greeting, no conversational preamble, no 'let me think' or "
+          "'I remember' framing, no trailing commentary. Keep it as short as the question "
+          "allows, ideally well under 20 words, since it has to fit on a tiny display."
+        ),
+      }
+    )
   text_ctx: list[str] = []
   image_ctx: list[str] = []
   research_ctx = ""
@@ -260,14 +312,17 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     )
 
   converted = [m.model_dump() for m in req.messages]
-  if image_ctx:
+  if image_ctx or display_target:
     last_user_idx = -1
     for i in range(len(converted) - 1, -1, -1):
       if converted[i]["role"] == "user":
         last_user_idx = i
         break
     if last_user_idx >= 0:
-      converted[last_user_idx]["images"] = image_ctx
+      if image_ctx:
+        converted[last_user_idx]["images"] = image_ctx
+      if display_target:
+        converted[last_user_idx]["content"] = last_user
 
   payload_messages.extend(converted)
 
@@ -347,7 +402,20 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     if reply:
       await _store_memory(profile, "assistant", reply)
 
-  if not _queue_led_request(last_user):
+  if display_target and reply:
+    if display_target == "led":
+      _queue_led_display_answer(reply)
+      reply = f"{reply.rstrip()} Displaying it on the LED."
+    elif display_target == "lcd":
+      _queue_lcd_display_answer(reply)
+      reply = f"{reply.rstrip()} Displaying it on the LCD."
+    elif display_target == "pc":
+      pc_result = await _display_answer_on_pc(reply)
+      if pc_result.lower().startswith("windows action succeeded"):
+        reply = f"{reply.rstrip()} Displaying it on the PC screen."
+      else:
+        reply = f"{reply.rstrip()} I couldn't display it on the PC screen: {pc_result}"
+  elif not _queue_led_request(last_user):
     _queue_led_companion(last_user, reply)
 
   gesture_intent = _infer_gesture_intent(last_user, reply)

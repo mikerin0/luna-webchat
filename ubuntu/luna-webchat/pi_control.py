@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import shlex
+import textwrap
 from typing import Any
 
 import httpx
@@ -9,6 +10,8 @@ import httpx
 import led_controller
 from system_stats import _gpu_usage_percent
 from config import (
+    LCD_DISPLAY_ANSWER_DURATION_S,
+    LCD_DISPLAY_ANSWER_FONT_SIZE,
     LUNA_ARM_GESTURE_EXPLAIN_MIN_CHARS,
     LUNA_ARM_GESTURES_ENABLED,
     LUNA_PI_BEHAVIOR_TIMEOUT,
@@ -147,6 +150,22 @@ def _cancel_lcd_gpu_monitor() -> None:
   if _lcd_gpu_task is not None and not _lcd_gpu_task.done():
     _lcd_gpu_task.cancel()
   _lcd_gpu_task = None
+
+
+async def _display_answer_on_lcd(answer: str) -> bool:
+  _cancel_lcd_gpu_monitor()
+  text = " ".join(str(answer).split())[:240]
+  wrapped = "\n".join(textwrap.wrap(text, width=16)) or text
+  result = await _pi_headless_request(
+    "POST",
+    {"action": "text", "text": wrapped, "duration": LCD_DISPLAY_ANSWER_DURATION_S, "font_size": LCD_DISPLAY_ANSWER_FONT_SIZE},
+  )
+  return bool(result.get("ok", False))
+
+
+def _queue_lcd_display_answer(answer: str) -> None:
+  task = asyncio.create_task(_display_answer_on_lcd(answer))
+  task.add_done_callback(lambda completed: completed.exception())
 
 
 async def _capture_pi_camera_image(camera_index: int, annotated: bool = False) -> tuple[str | None, str | None]:

@@ -15,6 +15,17 @@ def _queue_led_thinking() -> None:
   if not led_controller.ENABLED:
     return
   task = asyncio.create_task(led_controller.display_thinking_animation())
+  # Expected to be cancelled mid-flight once a real reply is ready to show
+  # (see _cancel_thinking_task) -- don't let that CancelledError log as if
+  # it were a real failure.
+  task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+  led_controller._thinking_task = task
+
+
+def _queue_led_display_answer(answer: str) -> None:
+  if not led_controller.ENABLED:
+    return
+  task = asyncio.create_task(led_controller.display_text(answer))
   task.add_done_callback(lambda completed: completed.exception())
 
 

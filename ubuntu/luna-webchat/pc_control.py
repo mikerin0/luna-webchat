@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from config import WINDOWS_AGENT_TIMEOUT, WINDOWS_AGENT_TOKEN, WINDOWS_AGENT_URL
+from config import PC_DISPLAY_ANSWER_DURATION_S, WINDOWS_AGENT_TIMEOUT, WINDOWS_AGENT_TOKEN, WINDOWS_AGENT_URL
 
 _pending_pc_actions: dict[str, dict[str, str]] = {}
 _pending_pc_actions_lock = threading.Lock()
@@ -124,6 +124,26 @@ def _pc_payload_from_command(command: dict[str, str]) -> dict[str, Any] | None:
     if verb == "write":
         return {"action": "write", "path": command["path"], "content": command.get("content", "")}
     return None
+
+
+async def _display_answer_on_pc(answer: str) -> str:
+    text = " ".join(str(answer).split())[:500]
+    if not text:
+        return "There's nothing to display on the PC screen."
+    payload = {"action": "display", "text": text, "duration": PC_DISPLAY_ANSWER_DURATION_S}
+    return await _execute_pc_payload(payload)
+
+
+async def _display_image_on_pc(image_base64: str, caption: str = "") -> str:
+    if not image_base64:
+        return "There's no image to display on the PC screen."
+    payload = {
+        "action": "display",
+        "image_base64": image_base64,
+        "text": " ".join(str(caption).split())[:200],
+        "duration": PC_DISPLAY_ANSWER_DURATION_S,
+    }
+    return await _execute_pc_payload(payload)
 
 
 async def _execute_pc_payload(payload: dict[str, Any]) -> str:

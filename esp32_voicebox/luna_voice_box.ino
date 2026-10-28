@@ -113,7 +113,10 @@ void setupAmp() {
 void connectWiFi() {
   Serial.printf("Connecting to WiFi SSID '%s'...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.config(staticIP, gateway, subnet, dns);
+  // Temporarily back on DHCP to test whether the static IP itself was
+  // contributing to the intermittent connection failures -- uncomment to
+  // go back to the fixed 172.31.31.107 address once this is ruled in/out.
+  // WiFi.config(staticIP, gateway, subnet, dns);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
@@ -122,13 +125,19 @@ void connectWiFi() {
   }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-    WiFi.setSleep(true); // power-saving on by default -- only disabled
-                          // briefly around actual playback (see sendAndPlay),
-                          // since that's the only window where modem-sleep
-                          // transitions were actually audible as noise.
-                          // Leaving it off all the time drains the battery
-                          // for no benefit while just sitting idle.
+    Serial.printf("WiFi connected, IP: %s, RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    WiFi.setSleep(false); // disable WiFi modem-sleep power cycling. Tried
+                           // leaving power-saving on by default and only
+                           // disabling it around playback -- it genuinely
+                           // helped battery life, but cost real reliability:
+                           // multi-second delays and real stalls in the
+                           // device's own requests (confirmed via server
+                           // logs showing minutes-long gaps between what
+                           // should be ~5s wake-check cycles). Not worth it
+                           // for a device whose whole job is responsiveness.
+                           // If battery life needs help, do it a different
+                           // way (e.g. an auto-disarm timeout) that doesn't
+                           // touch the radio's responsiveness at all.
   } else {
     Serial.printf("WiFi connect failed, status=%d\n", WiFi.status());
   }
@@ -316,7 +325,7 @@ void sendAndPlay(size_t numSamples) {
   http.addHeader("Content-Type", String("multipart/form-data; boundary=") + boundary);
   http.setTimeout(30000);
 
-  Serial.println("Sending to Luna...");
+  Serial.printf("Sending to Luna... (RSSI: %d dBm)\n", WiFi.RSSI());
   int code = http.POST(body, bodyLen);
   free(body);
   Serial.printf("HTTP code: %d, declared size: %d\n", code, http.getSize());
@@ -361,13 +370,10 @@ void sendAndPlay(size_t numSamples) {
   size_t receivedBytes = waitAndRead(stream, replyBuf, dataBytes, 30000);
   http.end();
   if (receivedBytes < dataBytes) {
-    Serial.printf("Reply incomplete: got %u of %u bytes.\n", (unsigned)receivedBytes, dataBytes);
+    Serial.printf("Reply incomplete: got %u of %u bytes. (RSSI now: %d dBm)\n", (unsigned)receivedBytes, dataBytes, WiFi.RSSI());
   }
 
   Serial.println("Playing...");
-  WiFi.setSleep(false); // only disable modem-sleep for this window -- it's
-                         // the sole reason it was ever disabled in the first
-                         // place (noise during playback), not needed outside it
   i2s_start(I2S_PORT_AMP); // wake the amp up only for the duration of playback
   i2s_set_sample_rates(I2S_PORT_AMP, replyRate);
 
@@ -386,7 +392,6 @@ void sendAndPlay(size_t numSamples) {
   }
   i2s_zero_dma_buffer(I2S_PORT_AMP); // flush any trailing samples before going quiet
   i2s_stop(I2S_PORT_AMP);
-  WiFi.setSleep(true); // back to power-saving now that playback is done
 
   free(replyBuf);
   Serial.println("Playback done.\n");

@@ -59,6 +59,39 @@ WAKE_WORD_VARIANTS = [
   for v in os.getenv("LUNA_WAKE_WORD_VARIANTS", "luna,loon").split(",")
   if v.strip()
 ]
+
+# "Display the answer on <target>" phrase lists -- env-tunable so new
+# phrasing can be recognized by editing the env file, not the code, same
+# philosophy as WAKE_WORD_VARIANTS above.
+DISPLAY_TRIGGER_VERBS = [
+  v.strip().lower()
+  for v in os.getenv("LUNA_DISPLAY_TRIGGER_VERBS", "show,display,put,send,pull up,throw").split(",")
+  if v.strip()
+]
+DISPLAY_LED_PHRASES = [
+  v.strip().lower()
+  for v in os.getenv("LUNA_DISPLAY_LED_PHRASES", "led,sign,led sign,led display").split(",")
+  if v.strip()
+]
+DISPLAY_LCD_PHRASES = [
+  v.strip().lower()
+  for v in os.getenv(
+    "LUNA_DISPLAY_LCD_PHRASES",
+    "lcd,2 inch screen,2-inch screen,small screen,robot screen,robot's screen,robot face,pi screen",
+  ).split(",")
+  if v.strip()
+]
+DISPLAY_PC_PHRASES = [
+  v.strip().lower()
+  for v in os.getenv(
+    "LUNA_DISPLAY_PC_PHRASES",
+    "pc screen,pc,computer screen,computer,my screen,windows screen,windows pc,my computer,my pc",
+  ).split(",")
+  if v.strip()
+]
+LCD_DISPLAY_ANSWER_DURATION_S = float(os.getenv("LUNA_LCD_DISPLAY_ANSWER_DURATION_S", "25"))
+LCD_DISPLAY_ANSWER_FONT_SIZE = int(os.getenv("LUNA_LCD_DISPLAY_ANSWER_FONT_SIZE", "54"))
+PC_DISPLAY_ANSWER_DURATION_S = float(os.getenv("LUNA_PC_DISPLAY_ANSWER_DURATION_S", "20"))
 TRANSCRIBE_LANGUAGE = os.getenv("LUNA_TRANSCRIBE_LANGUAGE", "en").strip()
 ONLINE_AI_ENABLED = os.getenv("LUNA_ONLINE_AI_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ONLINE_AI_URL = os.getenv("LUNA_ONLINE_AI_URL", "https://api.openai.com/v1/chat/completions").strip()

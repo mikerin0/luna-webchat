@@ -50,6 +50,7 @@ _power_state: bool | None = None
 _clear_task: asyncio.Task | None = None
 _clock_task: asyncio.Task | None = None
 _gpu_task: asyncio.Task | None = None
+_thinking_task: asyncio.Task | None = None
 _last_text_frame = None
 _clock_base_epoch: float | None = None
 _clock_base_monotonic: float | None = None
@@ -366,6 +367,18 @@ def _cancel_gpu_task() -> None:
     _gpu_task = None
 
 
+def _cancel_thinking_task() -> None:
+    # The thinking animation's GIF upload over BLE can still be in flight
+    # when the real reply is ready -- if we let it finish, it can land
+    # *after* the reply's own display call and overwrite it, leaving the
+    # horse looping forever with nothing left to replace it. Cancelling
+    # before showing anything else closes that race.
+    global _thinking_task
+    if _thinking_task is not None and not _thinking_task.done():
+        _thinking_task.cancel()
+    _thinking_task = None
+
+
 def _clock_display_value(now: datetime) -> str:
     return now.strftime("%I:%M%p").lstrip("0")
 
@@ -512,6 +525,7 @@ async def display_text(text: str, color: str | None = None, rainbow_mode: int | 
         print(f"[LED] dry-run: {message or f'<icon:{pixel_icon}>'} color={color or COLOR} rainbow={rainbow_mode if rainbow_mode is not None else 0}")
         return True
 
+    _cancel_thinking_task()
     async with _lock:
         try:
             from pypixelcolor.lib.device_session import DeviceSession
@@ -808,6 +822,7 @@ async def display_image_url(url: str) -> bool:
         from pypixelcolor.commands.send_image import send_image
         from pypixelcolor.lib.device_session import DeviceSession
 
+        _cancel_thinking_task()
         async with _lock:
             async with DeviceSession(ADDRESS) as session:
                 await session.execute_command(send_image, temp_path, resize_method="crop")
